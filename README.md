@@ -49,6 +49,13 @@ Print checkpoint state:
 cargo run -- stats
 ```
 
+Browse saved records in SQLite:
+
+```sh
+sqlite3 -header -column state/rusneb.sqlite \
+  "SELECT id, title, year, catalog, pdf_count FROM records_flat LIMIT 20;"
+```
+
 ## GitHub Releases
 
 The GitHub Actions workflow runs tests on pushes and pull requests. Pushing any git tag builds release archives for Linux `amd64` and `arm64` and publishes them to GitHub Releases:

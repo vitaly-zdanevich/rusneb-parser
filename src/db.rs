@@ -79,6 +79,24 @@ impl Db {
                 json TEXT NOT NULL,
                 fetched_at INTEGER NOT NULL
             );
+
+            CREATE VIEW IF NOT EXISTS records_flat AS
+            SELECT
+                id,
+                json_extract(json, '$.metadata.title') AS title,
+                json_extract(json, '$.metadata.year') AS year,
+                json_extract(json, '$.metadata.authors') AS authors_json,
+                json_extract(json, '$.metadata.detail_map."Каталог"[0]') AS catalog,
+                json_extract(json, '$.metadata.detail_map."Библиотека"[0]') AS library,
+                json_extract(json, '$.metadata.detail_map."Язык"[0]') AS language,
+                json_extract(json, '$.metadata.bibliographic_description') AS bibliographic_description,
+                json_extract(json, '$.metadata.description') AS description,
+                json_extract(json, '$.metadata.topics') AS topics_json,
+                json_extract(json, '$.metadata.pdf_links') AS pdf_links_json,
+                json_array_length(json_extract(json, '$.metadata.pdf_links')) AS pdf_count,
+                json_extract(json, '$.url') AS url,
+                fetched_at
+            FROM records;
             "#,
         )?;
         Ok(())
