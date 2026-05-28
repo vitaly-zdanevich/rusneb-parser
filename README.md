@@ -61,8 +61,8 @@ sqlite3 -header -column state/rusneb.sqlite \
 The GitHub Actions workflow runs tests on pushes and pull requests. Pushing any git tag builds release archives for Linux `amd64` and `arm64` and publishes them to GitHub Releases:
 
 ```sh
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 ## Resume Model
