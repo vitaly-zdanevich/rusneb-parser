@@ -49,6 +49,15 @@ Print checkpoint state:
 cargo run -- stats
 ```
 
+## GitHub Releases
+
+The GitHub Actions workflow runs tests on pushes and pull requests. Pushing any git tag builds release archives for Linux `amd64` and `arm64` and publishes them to GitHub Releases:
+
+```sh
+git tag v0.1.1
+git push origin v0.1.1
+```
+
 ## Resume Model
 
 The default state file is `state/rusneb.sqlite`. On startup, any `in_progress` search page or item is reset to `pending`, so Ctrl-C or a power loss resumes from the last committed checkpoint instead of starting over.
