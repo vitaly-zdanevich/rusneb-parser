@@ -1,0 +1,12 @@
+/target/
+
+# Crawler runtime state and outputs
+/state/
+/out/
+/logs/
+
+# Local/editor noise
+.env
+.env.*
+*.swp
+*~

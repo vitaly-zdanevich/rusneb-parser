@@ -1,0 +1,28 @@
+[package]
+name = "rusneb-parser"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["parquet-export"]
+parquet-export = ["dep:arrow-array", "dep:arrow-schema", "dep:parquet"]
+
+[dependencies]
+anyhow = "1"
+arrow-array = { version = "53", optional = true }
+arrow-schema = { version = "53", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+ctrlc = "3.4"
+flate2 = "1"
+html-escape = "0.2"
+parquet = { version = "53", optional = true, features = ["arrow"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "brotli", "cookies", "deflate", "gzip", "json", "rustls-tls"] }
+roxmltree = "0.20"
+rusqlite = { version = "0.32", features = ["bundled"] }
+scraper = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+url = "2"
+xz2 = "0.1"
