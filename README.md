@@ -1,6 +1,6 @@
 # rusneb-parser
 
-Single-threaded metadata crawler for `rusneb.ru`.
+Single-threaded metadata crawler for [rusneb.ru](https://rusneb.ru/).
 
 The crawler is deliberately conservative: it uses one blocking HTTP client, a configurable delay between every request, and a SQLite state file for crash-safe resume. Final data can be exported as JSON Lines (`.jsonl`, `.jsonl.gz`, `.jsonl.xz`) and, with the default feature set, Parquet.
 
@@ -61,8 +61,8 @@ sqlite3 -header -column state/rusneb.sqlite \
 The GitHub Actions workflow runs tests on pushes and pull requests. Pushing any git tag builds release archives for Linux `amd64` and `arm64` and publishes them to GitHub Releases:
 
 ```sh
-git tag v0.1.3
-git push origin v0.1.3
+git tag v0.1.4
+git push origin v0.1.4
 ```
 
 ## Resume Model
