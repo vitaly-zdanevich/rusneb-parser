@@ -38,7 +38,7 @@ jobs:
         run: cargo test --locked --all-features
 
   build-release:
-    name: Build release (${{ matrix.arch }})
+    name: Build release (${{ matrix.package }})
     if: startsWith(github.ref, 'refs/tags/')
     needs: test
     runs-on: ${{ matrix.runner }}
@@ -46,12 +46,42 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
+          - package: linux-amd64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - arch: arm64
+            archive: tar.gz
+            exe_suffix: ""
+            android: false
+          - package: linux-arm64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            exe_suffix: ""
+            android: false
+          - package: windows-amd64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            exe_suffix: ".exe"
+            android: false
+          - package: macos-amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            exe_suffix: ""
+            android: false
+          - package: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            exe_suffix: ""
+            android: false
+          - package: android-arm64
+            runner: ubuntu-24.04
+            target: aarch64-linux-android
+            archive: tar.gz
+            exe_suffix: ""
+            android: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,25 +92,83 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.target }}
 
+      - name: Configure Android NDK
+        if: matrix.android
+        shell: bash
+        run: |
+          ndk_root="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$ndk_root" ]; then
+            ndk_root="$(find "$ANDROID_HOME/ndk" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)"
+          fi
+          toolchain="$ndk_root/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          linker="$toolchain/aarch64-linux-android24-clang"
+          if [ ! -x "$linker" ]; then
+            linker="$toolchain/aarch64-linux-android21-clang"
+          fi
+          test -x "$linker"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$linker" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=$linker" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$toolchain/llvm-ar" >> "$GITHUB_ENV"
+
       - name: Build binary
         run: cargo build --locked --release --target ${{ matrix.target }} --all-features
 
       - name: Package archive
+        shell: bash
+        env:
+          PACKAGE: ${{ matrix.package }}
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: ${{ matrix.archive }}
+          EXE_SUFFIX: ${{ matrix.exe_suffix }}
         run: |
-          archive="rusneb-parser-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}"
-          mkdir "$archive"
-          cp "target/${{ matrix.target }}/release/rusneb-parser" "$archive/"
-          cp README.md LICENSE "$archive/"
-          tar -czf "$archive.tar.gz" "$archive"
-          sha256sum "$archive.tar.gz" > "$archive.tar.gz.sha256"
+          python_bin="python3"
+          if ! command -v "$python_bin" >/dev/null 2>&1; then
+            python_bin="python"
+          fi
+          "$python_bin" - <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import shutil
+          import tarfile
+          import zipfile
+
+          ref = os.environ["GITHUB_REF_NAME"]
+          package = os.environ["PACKAGE"]
+          target = os.environ["TARGET"]
+          archive_ext = os.environ["ARCHIVE"]
+          exe_suffix = os.environ["EXE_SUFFIX"]
+
+          archive_name = f"rusneb-parser-{ref}-{package}"
+          stage = pathlib.Path(archive_name)
+          stage.mkdir()
+
+          binary = pathlib.Path("target") / target / "release" / f"rusneb-parser{exe_suffix}"
+          shutil.copy2(binary, stage / binary.name)
+          shutil.copy2("README.md", stage / "README.md")
+          shutil.copy2("LICENSE", stage / "LICENSE")
+
+          if archive_ext == "zip":
+              output = pathlib.Path(f"{archive_name}.zip")
+              with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                  for path in sorted(stage.rglob("*")):
+                      zf.write(path, path.as_posix())
+          else:
+              output = pathlib.Path(f"{archive_name}.tar.gz")
+              with tarfile.open(output, "w:gz") as tf:
+                  tf.add(stage, arcname=stage.name)
+
+          digest = hashlib.sha256(output.read_bytes()).hexdigest()
+          pathlib.Path(f"{output}.sha256").write_text(f"{digest}  {output.name}\n", encoding="utf-8")
+          PY
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rusneb-parser-linux-${{ matrix.arch }}
+          name: rusneb-parser-${{ matrix.package }}
           path: |
-            rusneb-parser-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz
-            rusneb-parser-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz.sha256
+            rusneb-parser-${{ github.ref_name }}-${{ matrix.package }}.${{ matrix.archive }}
+            rusneb-parser-${{ github.ref_name }}-${{ matrix.package }}.${{ matrix.archive }}.sha256
           if-no-files-found: error
 
   release:

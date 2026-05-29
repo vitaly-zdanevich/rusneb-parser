@@ -58,11 +58,11 @@ sqlite3 -header -column state/rusneb.sqlite \
 
 ## GitHub Releases
 
-The GitHub Actions workflow runs tests on pushes and pull requests. Pushing any git tag builds release archives for Linux `amd64` and `arm64` and publishes them to GitHub Releases:
+The GitHub Actions workflow runs tests on pushes and pull requests. Pushing any git tag builds release archives for Linux, Windows, macOS, and Android, then publishes them to GitHub Releases. The Android artifact is a raw `aarch64-linux-android` command-line binary, not an APK.
 
 ```sh
-git tag v0.1.5
-git push origin v0.1.5
+git tag v0.1.6
+git push origin v0.1.6
 ```
 
 ## Resume Model
