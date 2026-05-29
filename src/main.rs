@@ -12,7 +12,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -102,6 +102,22 @@ struct CrawlArgs {
     #[arg(long, default_value = "1")]
     workers: NonZeroUsize,
 
+    /// Minimum active workers when adaptive worker limiting slows down after transport errors.
+    #[arg(long, default_value = "1")]
+    min_workers: NonZeroUsize,
+
+    /// Disable adaptive worker limiting; all --workers stay active until shutdown.
+    #[arg(long)]
+    fixed_workers: bool,
+
+    /// Consecutive transport errors before adaptive limiting lowers active workers by one.
+    #[arg(long, default_value_t = 3)]
+    adaptive_decrease_after: u64,
+
+    /// Successful item fetches before adaptive limiting raises active workers by one.
+    #[arg(long, default_value_t = 50)]
+    adaptive_increase_after: u64,
+
     /// Do not discover search pages; only process queued or explicit IDs.
     #[arg(long)]
     no_discover: bool,
@@ -126,7 +142,7 @@ struct CrawlArgs {
     #[arg(long, default_value_t = 5)]
     max_attempts: u32,
 
-    /// Stop after this many consecutive card-page transport errors. Default is max(10, workers * 2). Use 0 to disable.
+    /// Stop after this many consecutive card-page transport errors. Default is max(20, workers * 4). Use 0 to disable.
     #[arg(long)]
     max_consecutive_transport_errors: Option<u64>,
 
@@ -190,6 +206,122 @@ struct WorkerStats {
     deferred: u64,
 }
 
+#[derive(Debug)]
+struct WorkerControl {
+    enabled: bool,
+    min_workers: usize,
+    max_workers: usize,
+    decrease_after: u64,
+    increase_after: u64,
+    active_workers: AtomicUsize,
+    stable_successes: AtomicU64,
+}
+
+impl WorkerControl {
+    fn new(
+        enabled: bool,
+        min_workers: usize,
+        max_workers: usize,
+        decrease_after: u64,
+        increase_after: u64,
+    ) -> Self {
+        Self {
+            enabled,
+            min_workers,
+            max_workers,
+            decrease_after,
+            increase_after,
+            active_workers: AtomicUsize::new(max_workers),
+            stable_successes: AtomicU64::new(0),
+        }
+    }
+
+    fn should_worker_run(&self, worker_id: usize) -> bool {
+        !self.enabled || worker_id <= self.active_workers.load(Ordering::SeqCst)
+    }
+
+    fn on_success(&self, worker_id: usize) {
+        if !self.enabled {
+            return;
+        }
+
+        let successes = self.stable_successes.fetch_add(1, Ordering::SeqCst) + 1;
+        if successes < self.increase_after {
+            return;
+        }
+        if self
+            .stable_successes
+            .compare_exchange(successes, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let mut current = self.active_workers.load(Ordering::SeqCst);
+        loop {
+            if current >= self.max_workers {
+                return;
+            }
+            let next = current + 1;
+            match self.active_workers.compare_exchange(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    eprintln!(
+                        "worker {worker_id}: adaptive workers increased to {next}/{} after {successes} successful item fetches",
+                        self.max_workers
+                    );
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn on_transport_error(&self, worker_id: usize, consecutive_errors: u64) {
+        if !self.enabled {
+            return;
+        }
+
+        self.on_item_failure();
+        if consecutive_errors == 0 || consecutive_errors % self.decrease_after != 0 {
+            return;
+        }
+
+        let mut current = self.active_workers.load(Ordering::SeqCst);
+        loop {
+            if current <= self.min_workers {
+                return;
+            }
+            let next = current - 1;
+            match self.active_workers.compare_exchange(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    eprintln!(
+                        "worker {worker_id}: adaptive workers decreased to {next}/{} after {consecutive_errors} consecutive transport errors",
+                        self.max_workers
+                    );
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn on_item_failure(&self) {
+        if self.enabled {
+            self.stable_successes.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -245,20 +377,35 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         db.seed_search_page(&search_key, &params_json, args.start_page)?;
     }
 
-    eprintln!(
-        "starting {} item worker{}",
-        args.workers.get(),
-        if args.workers.get() == 1 { "" } else { "s" }
-    );
-
     let discovery_done = Arc::new(AtomicBool::new(args.no_discover));
     let started_items = Arc::new(AtomicU64::new(0));
     let consecutive_transport_errors = Arc::new(AtomicU64::new(0));
     let workers = args.workers.get();
+    let min_workers = args.min_workers.get().min(workers);
+    let adaptive_enabled = !args.fixed_workers && min_workers < workers;
+    let worker_control = Arc::new(WorkerControl::new(
+        adaptive_enabled,
+        min_workers,
+        workers,
+        args.adaptive_decrease_after.max(1),
+        args.adaptive_increase_after.max(1),
+    ));
     let transport_error_limit = args
         .max_consecutive_transport_errors
-        .or_else(|| Some((workers as u64).saturating_mul(2).max(10)))
+        .or_else(|| Some((workers as u64).saturating_mul(4).max(20)))
         .filter(|limit| *limit > 0);
+
+    eprintln!(
+        "starting {} item worker{}{}",
+        workers,
+        if workers == 1 { "" } else { "s" },
+        if adaptive_enabled {
+            format!(" (adaptive active range {min_workers}..={workers})")
+        } else {
+            " (fixed active count)".to_string()
+        }
+    );
+
     let mut worker_handles = Vec::with_capacity(workers);
 
     for worker_index in 0..workers {
@@ -269,6 +416,7 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         let discovery_done = Arc::clone(&discovery_done);
         let started_items = Arc::clone(&started_items);
         let consecutive_transport_errors = Arc::clone(&consecutive_transport_errors);
+        let worker_control = Arc::clone(&worker_control);
         let delay = Duration::from_millis(args.delay_ms);
         let timeout = Duration::from_secs(args.timeout_secs);
         let max_attempts = args.max_attempts;
@@ -290,6 +438,7 @@ fn crawl(args: CrawlArgs) -> Result<()> {
                 discovery_done,
                 started_items,
                 consecutive_transport_errors,
+                worker_control,
             );
             if result.is_err() {
                 shutdown_on_error.store(true, Ordering::SeqCst);
@@ -449,6 +598,7 @@ fn item_worker(
     discovery_done: Arc<AtomicBool>,
     started_items: Arc<AtomicU64>,
     consecutive_transport_errors: Arc<AtomicU64>,
+    worker_control: Arc<WorkerControl>,
 ) -> Result<WorkerStats> {
     let mut db = Db::open(&db_path)?;
     let mut client = RusnebClient::new(&base_url, &user_agent, delay, timeout)?;
@@ -457,6 +607,14 @@ fn item_worker(
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
+        }
+
+        if !worker_control.should_worker_run(worker_id) {
+            if discovery_done.load(Ordering::SeqCst) && db.count_item_backlog(max_attempts)? == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(500));
+            continue;
         }
 
         let reserved_slot = max_items.is_some();
@@ -489,6 +647,7 @@ fn item_worker(
                 db.save_record(&item.id, &json, fetched_at)?;
                 stats.saved += 1;
                 eprintln!("worker {worker_id}: saved {}", item.id);
+                worker_control.on_success(worker_id);
             }
             Err(error) => {
                 if error.status.is_none() {
@@ -500,6 +659,7 @@ fn item_worker(
                         "worker {worker_id}: deferred {} after transport error: {}",
                         item.id, error.message
                     );
+                    worker_control.on_transport_error(worker_id, consecutive);
                     if transport_error_limit.is_some_and(|limit| consecutive >= limit) {
                         eprintln!(
                             "worker {worker_id}: stopping after {consecutive} consecutive transport errors"
@@ -509,6 +669,7 @@ fn item_worker(
                 } else {
                     db.fail_item(&item.id, &error.message, error.status)?;
                     stats.failed += 1;
+                    worker_control.on_item_failure();
                     eprintln!("worker {worker_id}: failed {}: {}", item.id, error.message);
                 }
             }

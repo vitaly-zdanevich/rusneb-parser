@@ -2,7 +2,7 @@
 
 Metadata crawler for [rusneb.ru](https://rusneb.ru/).
 
-The crawler is deliberately conservative by default: it uses one item fetch worker, a configurable delay between requests, and a SQLite state file for crash-safe resume. The item worker count can be increased with `--workers`; search-page discovery stays single-threaded and keeps only a small item backlog ahead of the workers. If card-page transport errors happen repeatedly, affected items are put back to `pending` without spending retry attempts and the crawl stops so it can be resumed later. Final data can be exported as JSON Lines (`.jsonl`, `.jsonl.gz`, `.jsonl.xz`) and, with the default feature set, Parquet.
+The crawler is deliberately conservative by default: it uses one item fetch worker, a configurable delay between requests, and a SQLite state file for crash-safe resume. The item worker maximum can be increased with `--workers`; search-page discovery stays single-threaded and keeps only a small item backlog ahead of the workers. Adaptive worker limiting is enabled by default for multi-worker crawls: timeout bursts lower the active worker count, and sustained successful fetches raise it again. If card-page transport errors happen repeatedly, affected items are put back to `pending` without spending retry attempts and the crawl stops so it can be resumed later. Final data can be exported as JSON Lines (`.jsonl`, `.jsonl.gz`, `.jsonl.xz`) and, with the default feature set, Parquet.
 
 ## What It Collects
 
@@ -35,16 +35,28 @@ Continue from the same checkpoint and fetch queued items:
 cargo run -- crawl --no-discover --max-items 100 --delay-ms 1500
 ```
 
-Run with ten parallel item workers:
+Run with up to ten parallel item workers:
 
 ```sh
 cargo run -- crawl --workers 10
+```
+
+Start at five workers, allow adaptive limiting to drop as low as three, then recover after stable successful fetches:
+
+```sh
+cargo run -- crawl --workers 5 --min-workers 3
 ```
 
 For unreliable network/server periods, tune the automatic stop threshold:
 
 ```sh
 cargo run -- crawl --workers 10 --max-consecutive-transport-errors 30
+```
+
+Use a fixed worker count without adaptive limiting:
+
+```sh
+cargo run -- crawl --workers 3 --fixed-workers
 ```
 
 Export all completed records:
@@ -73,8 +85,8 @@ sqlite3 -header -column state/rusneb.sqlite \
 The GitHub Actions workflow runs tests on pushes and pull requests. Pushing any git tag builds release archives for Linux, Windows, macOS, and Android, then publishes them to GitHub Releases. The Android artifact is a raw `aarch64-linux-android` command-line binary, not an APK.
 
 ```sh
-git tag v0.1.7
-git push origin v0.1.7
+git tag v0.1.8
+git push origin v0.1.8
 ```
 
 ## Resume Model
