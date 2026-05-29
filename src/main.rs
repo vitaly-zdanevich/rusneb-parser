@@ -693,11 +693,12 @@ fn item_worker(
         match client.fetch_record(&item.id) {
             Ok(record) => {
                 consecutive_transient_errors.store(0, Ordering::SeqCst);
+                let title = log_record_title(&record);
                 let fetched_at = record.fetched_at_unix;
                 let json = serde_json::to_string(&record)?;
                 db.save_record(&item.id, &json, fetched_at)?;
                 stats.saved += 1;
-                eprintln!("worker {worker_id}: saved {}", item.id);
+                eprintln!("worker {worker_id}: saved {} | {title}", item.id);
                 worker_control.on_success(worker_id);
             }
             Err(error) => {
@@ -754,6 +755,16 @@ fn reserve_item_slot(max_items: Option<u64>, started_items: &AtomicU64) -> bool 
             Err(actual) => current = actual,
         }
     }
+}
+
+fn log_record_title(record: &model::RusnebRecord) -> String {
+    record
+        .metadata
+        .title
+        .as_deref()
+        .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "<no title>".to_string())
 }
 
 fn is_transient_failure(status: Option<u16>) -> bool {
