@@ -1,8 +1,8 @@
 # rusneb-parser
 
-Single-threaded metadata crawler for [rusneb.ru](https://rusneb.ru/).
+Metadata crawler for [rusneb.ru](https://rusneb.ru/).
 
-The crawler is deliberately conservative: it uses one blocking HTTP client, a configurable delay between every request, and a SQLite state file for crash-safe resume. Final data can be exported as JSON Lines (`.jsonl`, `.jsonl.gz`, `.jsonl.xz`) and, with the default feature set, Parquet.
+The crawler is deliberately conservative by default: it uses one item fetch worker, a configurable delay between requests, and a SQLite state file for crash-safe resume. The item worker count can be increased with `--workers`; search-page discovery stays single-threaded and keeps only a small item backlog ahead of the workers. If card-page transport errors happen repeatedly, affected items are put back to `pending` without spending retry attempts and the crawl stops so it can be resumed later. Final data can be exported as JSON Lines (`.jsonl`, `.jsonl.gz`, `.jsonl.xz`) and, with the default feature set, Parquet.
 
 ## What It Collects
 
@@ -35,6 +35,18 @@ Continue from the same checkpoint and fetch queued items:
 cargo run -- crawl --no-discover --max-items 100 --delay-ms 1500
 ```
 
+Run with ten parallel item workers:
+
+```sh
+cargo run -- crawl --workers 10
+```
+
+For unreliable network/server periods, tune the automatic stop threshold:
+
+```sh
+cargo run -- crawl --workers 10 --max-consecutive-transport-errors 30
+```
+
 Export all completed records:
 
 ```sh
@@ -61,13 +73,13 @@ sqlite3 -header -column state/rusneb.sqlite \
 The GitHub Actions workflow runs tests on pushes and pull requests. Pushing any git tag builds release archives for Linux, Windows, macOS, and Android, then publishes them to GitHub Releases. The Android artifact is a raw `aarch64-linux-android` command-line binary, not an APK.
 
 ```sh
-git tag v0.1.6
-git push origin v0.1.6
+git tag v0.1.7
+git push origin v0.1.7
 ```
 
 ## Resume Model
 
-The default state file is `state/rusneb.sqlite`. On startup, any `in_progress` search page or item is reset to `pending`, so Ctrl-C or a power loss resumes from the last committed checkpoint instead of starting over.
+The default state file is `state/rusneb.sqlite`. On crawl startup, any `in_progress` search page or item is reset to `pending`, so Ctrl-C or a power loss resumes from the last committed checkpoint instead of starting over.
 
 Each saved record and its item status are committed in one transaction. Search pages and item IDs are de-duplicated by primary keys.
 

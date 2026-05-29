@@ -271,10 +271,11 @@ impl RusnebClient {
     }
 }
 
-fn to_fetch_failure(error: impl std::fmt::Display) -> FetchFailure {
+fn to_fetch_failure(error: impl Into<anyhow::Error>) -> FetchFailure {
+    let error = error.into();
     FetchFailure {
         status: None,
-        message: error.to_string(),
+        message: format!("{error:#}"),
     }
 }
 

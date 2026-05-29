@@ -8,15 +8,17 @@ use clap::{Args, Parser, Subcommand};
 use db::Db;
 use rusneb::{RusnebClient, SearchParams};
 use std::io::BufRead;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::thread;
 use std::time::Duration;
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Single-threaded NЭБ/rusneb.ru metadata crawler")]
+#[command(version, about = "NЭБ/rusneb.ru metadata crawler")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -96,6 +98,10 @@ struct CrawlArgs {
     #[arg(long)]
     max_items: Option<u64>,
 
+    /// Parallel item fetch workers. Search-page discovery remains single-threaded.
+    #[arg(long, default_value = "1")]
+    workers: NonZeroUsize,
+
     /// Do not discover search pages; only process queued or explicit IDs.
     #[arg(long)]
     no_discover: bool,
@@ -120,11 +126,12 @@ struct CrawlArgs {
     #[arg(long, default_value_t = 5)]
     max_attempts: u32,
 
+    /// Stop after this many consecutive card-page transport errors. Default is max(10, workers * 2). Use 0 to disable.
+    #[arg(long)]
+    max_consecutive_transport_errors: Option<u64>,
+
     /// User-Agent sent to rusneb.ru.
-    #[arg(
-        long,
-        default_value = "rusneb-parser/0.1 single-threaded metadata crawler"
-    )]
+    #[arg(long, default_value = "rusneb-parser/0.1 metadata crawler")]
     user_agent: String,
 
     /// Export gzip JSONL from the SQLite records table before exit.
@@ -176,6 +183,13 @@ struct StatsArgs {
     common: CommonArgs,
 }
 
+#[derive(Debug, Default)]
+struct WorkerStats {
+    saved: u64,
+    failed: u64,
+    deferred: u64,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -200,12 +214,7 @@ fn main() -> Result<()> {
 fn crawl(args: CrawlArgs) -> Result<()> {
     let shutdown = install_shutdown_handler()?;
     let mut db = Db::open(&args.common.db)?;
-    let mut client = RusnebClient::new(
-        &args.base_url,
-        &args.user_agent,
-        Duration::from_millis(args.delay_ms),
-        Duration::from_secs(args.timeout_secs),
-    )?;
+    db.reset_interrupted_work()?;
 
     let explicit_ids = load_ids(&args.ids, args.ids_file.as_ref())?;
     if !explicit_ids.is_empty() {
@@ -232,50 +241,152 @@ fn crawl(args: CrawlArgs) -> Result<()> {
     db.set_meta("search_params", &search_key)?;
     let search_key = stable_search_key(&search_key);
     let params_json = search_params.key_json()?;
-
-    let last_search_page = args
-        .max_pages
-        .map(|n| args.start_page.saturating_add(n).saturating_sub(1));
     if !args.no_discover {
         db.seed_search_page(&search_key, &params_json, args.start_page)?;
     }
 
-    let mut fetched_items = 0u64;
+    eprintln!(
+        "starting {} item worker{}",
+        args.workers.get(),
+        if args.workers.get() == 1 { "" } else { "s" }
+    );
+
+    let discovery_done = Arc::new(AtomicBool::new(args.no_discover));
+    let started_items = Arc::new(AtomicU64::new(0));
+    let consecutive_transport_errors = Arc::new(AtomicU64::new(0));
+    let workers = args.workers.get();
+    let transport_error_limit = args
+        .max_consecutive_transport_errors
+        .or_else(|| Some((workers as u64).saturating_mul(2).max(10)))
+        .filter(|limit| *limit > 0);
+    let mut worker_handles = Vec::with_capacity(workers);
+
+    for worker_index in 0..workers {
+        let db_path = args.common.db.clone();
+        let base_url = args.base_url.clone();
+        let user_agent = args.user_agent.clone();
+        let shutdown = Arc::clone(&shutdown);
+        let discovery_done = Arc::clone(&discovery_done);
+        let started_items = Arc::clone(&started_items);
+        let consecutive_transport_errors = Arc::clone(&consecutive_transport_errors);
+        let delay = Duration::from_millis(args.delay_ms);
+        let timeout = Duration::from_secs(args.timeout_secs);
+        let max_attempts = args.max_attempts;
+        let max_items = args.max_items;
+
+        worker_handles.push(thread::spawn(move || {
+            let shutdown_on_error = Arc::clone(&shutdown);
+            let result = item_worker(
+                worker_index + 1,
+                db_path,
+                base_url,
+                user_agent,
+                delay,
+                timeout,
+                max_attempts,
+                max_items,
+                transport_error_limit,
+                shutdown,
+                discovery_done,
+                started_items,
+                consecutive_transport_errors,
+            );
+            if result.is_err() {
+                shutdown_on_error.store(true, Ordering::SeqCst);
+            }
+            result
+        }));
+    }
+
+    let discovery_result = if args.no_discover {
+        Ok(())
+    } else {
+        match RusnebClient::new(
+            &args.base_url,
+            &args.user_agent,
+            Duration::from_millis(args.delay_ms),
+            Duration::from_secs(args.timeout_secs),
+        ) {
+            Ok(mut client) => run_search_discovery(
+                &args,
+                &mut db,
+                &mut client,
+                &search_params,
+                &search_key,
+                &params_json,
+                &shutdown,
+            ),
+            Err(error) => Err(error),
+        }
+    };
+
+    if discovery_result.is_err() {
+        shutdown.store(true, Ordering::SeqCst);
+    }
+    discovery_done.store(true, Ordering::SeqCst);
+
+    let mut worker_stats = WorkerStats::default();
+    let mut worker_errors = Vec::new();
+    for handle in worker_handles {
+        match handle.join() {
+            Ok(Ok(stats)) => {
+                worker_stats.saved += stats.saved;
+                worker_stats.failed += stats.failed;
+                worker_stats.deferred += stats.deferred;
+            }
+            Ok(Err(error)) => worker_errors.push(error),
+            Err(error) => worker_errors.push(anyhow::anyhow!("worker thread panicked: {error:?}")),
+        }
+    }
+
+    discovery_result?;
+    if !worker_errors.is_empty() {
+        let mut message = format!("{} item worker(s) failed", worker_errors.len());
+        for error in worker_errors {
+            message.push_str(&format!("\n- {error:#}"));
+        }
+        anyhow::bail!("{message}");
+    }
+
+    eprintln!(
+        "item workers stopped: saved={}, failed={}, deferred={}",
+        worker_stats.saved, worker_stats.failed, worker_stats.deferred
+    );
+
+    if let Some(output) = args.export_jsonl {
+        let count = export::export_jsonl(&db, &output)?;
+        eprintln!("exported {count} records to {}", output.display());
+    }
+
+    Ok(())
+}
+
+fn run_search_discovery(
+    args: &CrawlArgs,
+    db: &mut Db,
+    client: &mut RusnebClient,
+    search_params: &SearchParams,
+    search_key: &str,
+    params_json: &str,
+    shutdown: &AtomicBool,
+) -> Result<()> {
+    let last_search_page = args
+        .max_pages
+        .map(|n| args.start_page.saturating_add(n).saturating_sub(1));
+    let backlog_target = (args.workers.get() as u64).saturating_mul(3).max(15);
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
-            eprintln!("shutdown requested; stopping after current checkpoint");
+            eprintln!("shutdown requested; stopping discovery after current checkpoint");
             break;
         }
 
-        let item_limit_reached = args.max_items.is_some_and(|max| fetched_items >= max);
-        if !item_limit_reached {
-            if let Some(item) = db.next_item(args.max_attempts)? {
-                db.mark_item_started(&item.id)?;
-                match client.fetch_record(&item.id) {
-                    Ok(record) => {
-                        let fetched_at = record.fetched_at_unix;
-                        let json = serde_json::to_string(&record)?;
-                        db.save_record(&item.id, &json, fetched_at)?;
-                        fetched_items += 1;
-                        eprintln!("saved {}", item.id);
-                    }
-                    Err(error) => {
-                        db.fail_item(&item.id, &error.message, error.status)?;
-                        eprintln!("failed {}: {}", item.id, error.message);
-                    }
-                }
-                continue;
-            }
-        } else if args.no_discover {
-            eprintln!("max item limit reached");
-            break;
+        if args.max_items.is_none() && db.count_item_backlog(args.max_attempts)? >= backlog_target {
+            thread::sleep(Duration::from_millis(250));
+            continue;
         }
 
-        if args.no_discover {
-            break;
-        }
-
-        let Some(page) = db.next_search_page(&search_key, args.max_attempts)? else {
+        let Some(page) = db.next_search_page(search_key, args.max_attempts)? else {
             break;
         };
         if last_search_page.is_some_and(|last| page.page > last) {
@@ -283,7 +394,7 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         }
 
         db.mark_search_page_started(&page.search_key, page.page)?;
-        match client.fetch_search_page(&search_params, page.page) {
+        match client.fetch_search_page(search_params, page.page) {
             Ok(result) => {
                 let inserted =
                     db.enqueue_items(Some(&page.search_key), Some(page.page), &result.ids)?;
@@ -302,7 +413,7 @@ fn crawl(args: CrawlArgs) -> Result<()> {
                     page.page,
                     result.ids.len(),
                     result.total_results,
-                    &params_json,
+                    params_json,
                     next_page,
                 )?;
                 eprintln!(
@@ -320,12 +431,114 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         }
     }
 
-    if let Some(output) = args.export_jsonl {
-        let count = export::export_jsonl(&db, &output)?;
-        eprintln!("exported {count} records to {}", output.display());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn item_worker(
+    worker_id: usize,
+    db_path: PathBuf,
+    base_url: String,
+    user_agent: String,
+    delay: Duration,
+    timeout: Duration,
+    max_attempts: u32,
+    max_items: Option<u64>,
+    transport_error_limit: Option<u64>,
+    shutdown: Arc<AtomicBool>,
+    discovery_done: Arc<AtomicBool>,
+    started_items: Arc<AtomicU64>,
+    consecutive_transport_errors: Arc<AtomicU64>,
+) -> Result<WorkerStats> {
+    let mut db = Db::open(&db_path)?;
+    let mut client = RusnebClient::new(&base_url, &user_agent, delay, timeout)?;
+    let mut stats = WorkerStats::default();
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let reserved_slot = max_items.is_some();
+        if !reserve_item_slot(max_items, &started_items) {
+            break;
+        }
+
+        let Some(item) = db.claim_next_item(max_attempts).with_context(|| {
+            format!(
+                "worker {worker_id} claiming next item from {}",
+                db_path.display()
+            )
+        })?
+        else {
+            if reserved_slot {
+                started_items.fetch_sub(1, Ordering::SeqCst);
+            }
+            if discovery_done.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        };
+
+        match client.fetch_record(&item.id) {
+            Ok(record) => {
+                consecutive_transport_errors.store(0, Ordering::SeqCst);
+                let fetched_at = record.fetched_at_unix;
+                let json = serde_json::to_string(&record)?;
+                db.save_record(&item.id, &json, fetched_at)?;
+                stats.saved += 1;
+                eprintln!("worker {worker_id}: saved {}", item.id);
+            }
+            Err(error) => {
+                if error.status.is_none() {
+                    db.defer_item_after_transport_error(&item.id, &error.message)?;
+                    stats.deferred += 1;
+                    let consecutive =
+                        consecutive_transport_errors.fetch_add(1, Ordering::SeqCst) + 1;
+                    eprintln!(
+                        "worker {worker_id}: deferred {} after transport error: {}",
+                        item.id, error.message
+                    );
+                    if transport_error_limit.is_some_and(|limit| consecutive >= limit) {
+                        eprintln!(
+                            "worker {worker_id}: stopping after {consecutive} consecutive transport errors"
+                        );
+                        shutdown.store(true, Ordering::SeqCst);
+                    }
+                } else {
+                    db.fail_item(&item.id, &error.message, error.status)?;
+                    stats.failed += 1;
+                    eprintln!("worker {worker_id}: failed {}: {}", item.id, error.message);
+                }
+            }
+        }
     }
 
-    Ok(())
+    Ok(stats)
+}
+
+fn reserve_item_slot(max_items: Option<u64>, started_items: &AtomicU64) -> bool {
+    let Some(max_items) = max_items else {
+        return true;
+    };
+
+    let mut current = started_items.load(Ordering::SeqCst);
+    loop {
+        if current >= max_items {
+            return false;
+        }
+
+        match started_items.compare_exchange(
+            current,
+            current + 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 fn enqueue_ids(args: EnqueueIdsArgs) -> Result<()> {

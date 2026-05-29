@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
 
 #[derive(Debug)]
@@ -32,7 +32,6 @@ impl Db {
 
         let db = Self { conn };
         db.migrate()?;
-        db.reset_interrupted_work()?;
         Ok(db)
     }
 
@@ -102,7 +101,7 @@ impl Db {
         Ok(())
     }
 
-    fn reset_interrupted_work(&self) -> Result<()> {
+    pub fn reset_interrupted_work(&self) -> Result<()> {
         let now = now_unix();
         self.conn.execute(
             "UPDATE search_pages SET status = 'pending', updated_at = ?1 WHERE status = 'in_progress'",
@@ -238,37 +237,43 @@ impl Db {
         Ok(inserted)
     }
 
-    pub fn next_item(&self, max_attempts: u32) -> Result<Option<CrawlItem>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id
-             FROM items
-             WHERE status IN ('pending', 'failed')
-               AND attempts < ?1
-             ORDER BY updated_at, id
-             LIMIT 1",
-        )?;
-
-        let item = stmt
-            .query_row(params![max_attempts as i64], |row| {
-                Ok(CrawlItem { id: row.get(0)? })
-            })
+    pub fn claim_next_item(&mut self, max_attempts: u32) -> Result<Option<CrawlItem>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = tx
+            .query_row(
+                "SELECT id
+                 FROM items
+                 WHERE status IN ('pending', 'failed')
+                   AND attempts < ?1
+                 ORDER BY updated_at, id
+                 LIMIT 1",
+                params![max_attempts as i64],
+                |row| row.get::<_, String>(0),
+            )
             .optional()?;
 
-        Ok(item)
-    }
+        let Some(id) = id else {
+            tx.commit()?;
+            return Ok(None);
+        };
 
-    pub fn mark_item_started(&self, id: &str) -> Result<()> {
-        self.conn.execute(
+        tx.execute(
             "UPDATE items
              SET status = 'in_progress',
                  attempts = attempts + 1,
                  last_error = NULL,
                  last_http_status = NULL,
-                 updated_at = ?2
-             WHERE id = ?1",
-            params![id, now_unix()],
+                 updated_at = ?3
+             WHERE id = ?1
+               AND status IN ('pending', 'failed')
+               AND attempts < ?2",
+            params![id, max_attempts as i64, now_unix()],
         )?;
-        Ok(())
+        tx.commit()?;
+
+        Ok(Some(CrawlItem { id }))
     }
 
     pub fn save_record(&mut self, id: &str, record_json: &str, fetched_at: i64) -> Result<()> {
@@ -311,12 +316,37 @@ impl Db {
         Ok(())
     }
 
+    pub fn defer_item_after_transport_error(&self, id: &str, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items
+             SET status = 'pending',
+                 attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                 last_error = ?2,
+                 last_http_status = NULL,
+                 updated_at = ?3
+             WHERE id = ?1",
+            params![id, error, now_unix()],
+        )?;
+        Ok(())
+    }
+
     pub fn count_records(&self) -> Result<u64> {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM records", [], |row| {
                 row.get::<_, i64>(0)
             })? as u64)
+    }
+
+    pub fn count_item_backlog(&self, max_attempts: u32) -> Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM items
+             WHERE status IN ('pending', 'in_progress')
+                OR (status = 'failed' AND attempts < ?1)",
+            params![max_attempts as i64],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
     }
 
     pub fn status_counts(&self, table: &str) -> Result<Vec<(String, u64)>> {

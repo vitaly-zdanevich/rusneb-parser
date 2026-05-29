@@ -1,4 +1,5 @@
 /target/
+/target-codex/
 
 # Crawler runtime state and outputs
 /state/
