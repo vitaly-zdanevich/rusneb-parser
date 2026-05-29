@@ -126,11 +126,14 @@ impl RusnebClient {
         &mut self,
         params: &SearchParams,
         page: u64,
-    ) -> Result<SearchPageResult> {
-        let url = self.search_url(params, page)?;
-        let response = self.get_text(url.as_str())?;
+    ) -> std::result::Result<SearchPageResult, FetchFailure> {
+        let url = self.search_url(params, page).map_err(to_fetch_failure)?;
+        let response = self.get_text(url.as_str()).map_err(to_fetch_failure)?;
         if !(200..300).contains(&response.status) {
-            anyhow::bail!("search page HTTP {}", response.status);
+            return Err(FetchFailure {
+                status: Some(response.status),
+                message: format!("search page HTTP {}", response.status),
+            });
         }
 
         Ok(SearchPageResult {

@@ -216,6 +216,24 @@ impl Db {
         Ok(())
     }
 
+    pub fn defer_search_page_after_transient_error(
+        &self,
+        search_key: &str,
+        page: u64,
+        error: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE search_pages
+             SET status = 'pending',
+                 attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                 last_error = ?3,
+                 updated_at = ?4
+             WHERE search_key = ?1 AND page = ?2",
+            params![search_key, page as i64, error, now_unix()],
+        )?;
+        Ok(())
+    }
+
     pub fn enqueue_items(
         &mut self,
         search_key: Option<&str>,
@@ -316,16 +334,26 @@ impl Db {
         Ok(())
     }
 
-    pub fn defer_item_after_transport_error(&self, id: &str, error: &str) -> Result<()> {
+    pub fn defer_item_after_transient_error(
+        &self,
+        id: &str,
+        error: &str,
+        http_status: Option<u16>,
+    ) -> Result<()> {
         self.conn.execute(
             "UPDATE items
              SET status = 'pending',
                  attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
                  last_error = ?2,
-                 last_http_status = NULL,
-                 updated_at = ?3
+                 last_http_status = ?3,
+                 updated_at = ?4
              WHERE id = ?1",
-            params![id, error, now_unix()],
+            params![
+                id,
+                error,
+                http_status.map(|status| status as i64),
+                now_unix()
+            ],
         )?;
         Ok(())
     }

@@ -12,7 +12,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -102,7 +102,7 @@ struct CrawlArgs {
     #[arg(long, default_value = "1")]
     workers: NonZeroUsize,
 
-    /// Minimum active workers when adaptive worker limiting slows down after transport errors.
+    /// Minimum active workers when adaptive worker limiting slows down after transient errors.
     #[arg(long, default_value = "1")]
     min_workers: NonZeroUsize,
 
@@ -110,7 +110,7 @@ struct CrawlArgs {
     #[arg(long)]
     fixed_workers: bool,
 
-    /// Consecutive transport errors before adaptive limiting lowers active workers by one.
+    /// Consecutive transient errors before adaptive limiting lowers active workers by one.
     #[arg(long, default_value_t = 3)]
     adaptive_decrease_after: u64,
 
@@ -142,9 +142,13 @@ struct CrawlArgs {
     #[arg(long, default_value_t = 5)]
     max_attempts: u32,
 
-    /// Stop after this many consecutive card-page transport errors. Default is max(20, workers * 4). Use 0 to disable.
+    /// Pause after this many consecutive transient card/search errors. Default is max(20, workers * 4). Use 0 to disable.
     #[arg(long)]
     max_consecutive_transport_errors: Option<u64>,
+
+    /// Pause duration after too many consecutive transient errors.
+    #[arg(long, default_value_t = 60)]
+    transient_error_pause_secs: u64,
 
     /// User-Agent sent to rusneb.ru.
     #[arg(long, default_value = "rusneb-parser/0.1 metadata crawler")]
@@ -281,7 +285,7 @@ impl WorkerControl {
         }
     }
 
-    fn on_transport_error(&self, worker_id: usize, consecutive_errors: u64) {
+    fn on_transient_error(&self, source: &str, consecutive_errors: u64) {
         if !self.enabled {
             return;
         }
@@ -305,7 +309,7 @@ impl WorkerControl {
             ) {
                 Ok(_) => {
                     eprintln!(
-                        "worker {worker_id}: adaptive workers decreased to {next}/{} after {consecutive_errors} consecutive transport errors",
+                        "{source}: adaptive workers decreased to {next}/{} after {consecutive_errors} consecutive transient errors",
                         self.max_workers
                     );
                     return;
@@ -379,7 +383,8 @@ fn crawl(args: CrawlArgs) -> Result<()> {
 
     let discovery_done = Arc::new(AtomicBool::new(args.no_discover));
     let started_items = Arc::new(AtomicU64::new(0));
-    let consecutive_transport_errors = Arc::new(AtomicU64::new(0));
+    let consecutive_transient_errors = Arc::new(AtomicU64::new(0));
+    let transient_pause_until = Arc::new(AtomicI64::new(0));
     let workers = args.workers.get();
     let min_workers = args.min_workers.get().min(workers);
     let adaptive_enabled = !args.fixed_workers && min_workers < workers;
@@ -390,10 +395,11 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         args.adaptive_decrease_after.max(1),
         args.adaptive_increase_after.max(1),
     ));
-    let transport_error_limit = args
+    let transient_error_pause_threshold = args
         .max_consecutive_transport_errors
         .or_else(|| Some((workers as u64).saturating_mul(4).max(20)))
         .filter(|limit| *limit > 0);
+    let transient_error_pause = Duration::from_secs(args.transient_error_pause_secs);
 
     eprintln!(
         "starting {} item worker{}{}",
@@ -415,7 +421,8 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         let shutdown = Arc::clone(&shutdown);
         let discovery_done = Arc::clone(&discovery_done);
         let started_items = Arc::clone(&started_items);
-        let consecutive_transport_errors = Arc::clone(&consecutive_transport_errors);
+        let consecutive_transient_errors = Arc::clone(&consecutive_transient_errors);
+        let transient_pause_until = Arc::clone(&transient_pause_until);
         let worker_control = Arc::clone(&worker_control);
         let delay = Duration::from_millis(args.delay_ms);
         let timeout = Duration::from_secs(args.timeout_secs);
@@ -433,11 +440,13 @@ fn crawl(args: CrawlArgs) -> Result<()> {
                 timeout,
                 max_attempts,
                 max_items,
-                transport_error_limit,
+                transient_error_pause_threshold,
+                transient_error_pause,
                 shutdown,
                 discovery_done,
                 started_items,
-                consecutive_transport_errors,
+                consecutive_transient_errors,
+                transient_pause_until,
                 worker_control,
             );
             if result.is_err() {
@@ -464,6 +473,11 @@ fn crawl(args: CrawlArgs) -> Result<()> {
                 &search_key,
                 &params_json,
                 &shutdown,
+                &consecutive_transient_errors,
+                &transient_pause_until,
+                &worker_control,
+                transient_error_pause_threshold,
+                transient_error_pause,
             ),
             Err(error) => Err(error),
         }
@@ -518,6 +532,11 @@ fn run_search_discovery(
     search_key: &str,
     params_json: &str,
     shutdown: &AtomicBool,
+    consecutive_transient_errors: &AtomicU64,
+    transient_pause_until: &AtomicI64,
+    worker_control: &WorkerControl,
+    transient_error_pause_threshold: Option<u64>,
+    transient_error_pause: Duration,
 ) -> Result<()> {
     let last_search_page = args
         .max_pages
@@ -527,6 +546,9 @@ fn run_search_discovery(
     loop {
         if shutdown.load(Ordering::SeqCst) {
             eprintln!("shutdown requested; stopping discovery after current checkpoint");
+            break;
+        }
+        if wait_for_transient_pause(shutdown, transient_pause_until) {
             break;
         }
 
@@ -545,6 +567,7 @@ fn run_search_discovery(
         db.mark_search_page_started(&page.search_key, page.page)?;
         match client.fetch_search_page(search_params, page.page) {
             Ok(result) => {
+                consecutive_transient_errors.store(0, Ordering::SeqCst);
                 let inserted =
                     db.enqueue_items(Some(&page.search_key), Some(page.page), &result.ids)?;
                 let next_page = if result.ids.is_empty() {
@@ -574,8 +597,31 @@ fn run_search_discovery(
                 );
             }
             Err(error) => {
-                db.fail_search_page(&page.search_key, page.page, &format!("{error:#}"))?;
-                eprintln!("failed search page {}: {error:#}", page.page);
+                if is_transient_failure(error.status) {
+                    db.defer_search_page_after_transient_error(
+                        &page.search_key,
+                        page.page,
+                        &error.message,
+                    )?;
+                    let consecutive =
+                        consecutive_transient_errors.fetch_add(1, Ordering::SeqCst) + 1;
+                    eprintln!(
+                        "deferred search page {} after transient error: {}",
+                        page.page, error.message
+                    );
+                    worker_control.on_transient_error("search discovery", consecutive);
+                    maybe_pause_after_transient_errors(
+                        "search discovery",
+                        consecutive,
+                        transient_error_pause_threshold,
+                        transient_error_pause,
+                        consecutive_transient_errors,
+                        transient_pause_until,
+                    );
+                } else {
+                    db.fail_search_page(&page.search_key, page.page, &error.message)?;
+                    eprintln!("failed search page {}: {}", page.page, error.message);
+                }
             }
         }
     }
@@ -593,11 +639,13 @@ fn item_worker(
     timeout: Duration,
     max_attempts: u32,
     max_items: Option<u64>,
-    transport_error_limit: Option<u64>,
+    transient_error_pause_threshold: Option<u64>,
+    transient_error_pause: Duration,
     shutdown: Arc<AtomicBool>,
     discovery_done: Arc<AtomicBool>,
     started_items: Arc<AtomicU64>,
-    consecutive_transport_errors: Arc<AtomicU64>,
+    consecutive_transient_errors: Arc<AtomicU64>,
+    transient_pause_until: Arc<AtomicI64>,
     worker_control: Arc<WorkerControl>,
 ) -> Result<WorkerStats> {
     let mut db = Db::open(&db_path)?;
@@ -606,6 +654,9 @@ fn item_worker(
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        if wait_for_transient_pause(&shutdown, &transient_pause_until) {
             break;
         }
 
@@ -641,7 +692,7 @@ fn item_worker(
 
         match client.fetch_record(&item.id) {
             Ok(record) => {
-                consecutive_transport_errors.store(0, Ordering::SeqCst);
+                consecutive_transient_errors.store(0, Ordering::SeqCst);
                 let fetched_at = record.fetched_at_unix;
                 let json = serde_json::to_string(&record)?;
                 db.save_record(&item.id, &json, fetched_at)?;
@@ -650,22 +701,25 @@ fn item_worker(
                 worker_control.on_success(worker_id);
             }
             Err(error) => {
-                if error.status.is_none() {
-                    db.defer_item_after_transport_error(&item.id, &error.message)?;
+                if is_transient_failure(error.status) {
+                    db.defer_item_after_transient_error(&item.id, &error.message, error.status)?;
                     stats.deferred += 1;
                     let consecutive =
-                        consecutive_transport_errors.fetch_add(1, Ordering::SeqCst) + 1;
+                        consecutive_transient_errors.fetch_add(1, Ordering::SeqCst) + 1;
                     eprintln!(
-                        "worker {worker_id}: deferred {} after transport error: {}",
+                        "worker {worker_id}: deferred {} after transient error: {}",
                         item.id, error.message
                     );
-                    worker_control.on_transport_error(worker_id, consecutive);
-                    if transport_error_limit.is_some_and(|limit| consecutive >= limit) {
-                        eprintln!(
-                            "worker {worker_id}: stopping after {consecutive} consecutive transport errors"
-                        );
-                        shutdown.store(true, Ordering::SeqCst);
-                    }
+                    let source = format!("worker {worker_id}");
+                    worker_control.on_transient_error(&source, consecutive);
+                    maybe_pause_after_transient_errors(
+                        &source,
+                        consecutive,
+                        transient_error_pause_threshold,
+                        transient_error_pause,
+                        &consecutive_transient_errors,
+                        &transient_pause_until,
+                    );
                 } else {
                     db.fail_item(&item.id, &error.message, error.status)?;
                     stats.failed += 1;
@@ -700,6 +754,67 @@ fn reserve_item_slot(max_items: Option<u64>, started_items: &AtomicU64) -> bool 
             Err(actual) => current = actual,
         }
     }
+}
+
+fn is_transient_failure(status: Option<u16>) -> bool {
+    match status {
+        None => true,
+        Some(status) => (500..600).contains(&status),
+    }
+}
+
+fn wait_for_transient_pause(shutdown: &AtomicBool, pause_until: &AtomicI64) -> bool {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return true;
+        }
+
+        let remaining = pause_until.load(Ordering::SeqCst) - db::now_unix();
+        if remaining <= 0 {
+            return false;
+        }
+
+        thread::sleep(Duration::from_secs(remaining.min(5) as u64));
+    }
+}
+
+fn maybe_pause_after_transient_errors(
+    source: &str,
+    consecutive_errors: u64,
+    threshold: Option<u64>,
+    pause: Duration,
+    consecutive_transient_errors: &AtomicU64,
+    pause_until: &AtomicI64,
+) {
+    let Some(threshold) = threshold else {
+        return;
+    };
+    if consecutive_errors < threshold {
+        return;
+    }
+
+    let pause_secs = pause.as_secs();
+    if pause_secs == 0 {
+        consecutive_transient_errors.store(0, Ordering::SeqCst);
+        return;
+    }
+
+    let until = db::now_unix().saturating_add(pause_secs as i64);
+    let mut current = pause_until.load(Ordering::SeqCst);
+    while current < until {
+        match pause_until.compare_exchange(current, until, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => {
+                consecutive_transient_errors.store(0, Ordering::SeqCst);
+                eprintln!(
+                    "{source}: pausing for {pause_secs}s after {consecutive_errors} consecutive transient errors"
+                );
+                return;
+            }
+            Err(actual) => current = actual,
+        }
+    }
+
+    consecutive_transient_errors.store(0, Ordering::SeqCst);
 }
 
 fn enqueue_ids(args: EnqueueIdsArgs) -> Result<()> {

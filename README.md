@@ -2,7 +2,7 @@
 
 Metadata crawler for [rusneb.ru](https://rusneb.ru/).
 
-The crawler is deliberately conservative by default: it uses one item fetch worker, a configurable delay between requests, and a SQLite state file for crash-safe resume. The item worker maximum can be increased with `--workers`; search-page discovery stays single-threaded and keeps only a small item backlog ahead of the workers. Adaptive worker limiting is enabled by default for multi-worker crawls: timeout bursts lower the active worker count, and sustained successful fetches raise it again. If card-page transport errors happen repeatedly, affected items are put back to `pending` without spending retry attempts and the crawl stops so it can be resumed later. Final data can be exported as JSON Lines (`.jsonl`, `.jsonl.gz`, `.jsonl.xz`) and, with the default feature set, Parquet.
+The crawler is deliberately conservative by default: it uses one item fetch worker, a configurable delay between requests, and a SQLite state file for crash-safe resume. The item worker maximum can be increased with `--workers`; search-page discovery stays single-threaded and keeps only a small item backlog ahead of the workers. Adaptive worker limiting is enabled by default for multi-worker crawls: transient server errors and timeout bursts lower the active worker count, and sustained successful fetches raise it again. If card/search transient errors happen repeatedly, affected rows are put back to `pending` without spending retry attempts, the crawler pauses, and then retries. Final data can be exported as JSON Lines (`.jsonl`, `.jsonl.gz`, `.jsonl.xz`) and, with the default feature set, Parquet.
 
 ## What It Collects
 
@@ -47,10 +47,10 @@ Start at five workers, allow adaptive limiting to drop as low as three, then rec
 cargo run -- crawl --workers 5 --min-workers 3
 ```
 
-For unreliable network/server periods, tune the automatic stop threshold:
+For unreliable network/server periods, tune the automatic transient-error pause threshold:
 
 ```sh
-cargo run -- crawl --workers 10 --max-consecutive-transport-errors 30
+cargo run -- crawl --workers 10 --max-consecutive-transport-errors 30 --transient-error-pause-secs 120
 ```
 
 Use a fixed worker count without adaptive limiting:
