@@ -74,6 +74,10 @@ struct CrawlArgs {
     #[arg(long)]
     publishyear_next: Option<String>,
 
+    /// Split discovery into one search stream per year in the inclusive publishyear range.
+    #[arg(long)]
+    shard_years: bool,
+
     /// Search sort field. Example: document_publishyearsort.
     #[arg(long)]
     sort_by: Option<String>,
@@ -201,6 +205,14 @@ struct ExportParquetArgs {
 struct StatsArgs {
     #[command(flatten)]
     common: CommonArgs,
+}
+
+#[derive(Debug)]
+struct SearchJob {
+    label: String,
+    params: SearchParams,
+    search_key: String,
+    params_json: String,
 }
 
 #[derive(Debug, Default)]
@@ -347,6 +359,63 @@ fn main() -> Result<()> {
     }
 }
 
+fn build_search_jobs(args: &CrawlArgs) -> Result<Vec<SearchJob>> {
+    let extra = parse_extra_params(&args.extra_params)?;
+    let base_params = SearchParams {
+        base_url: args.base_url.clone(),
+        query: args.query.clone(),
+        catalogs: args.catalogs.clone(),
+        access: args.access.clone(),
+        publishyear_prev: args.publishyear_prev.clone(),
+        publishyear_next: args.publishyear_next.clone(),
+        sort_by: args.sort_by.clone(),
+        order: args.order.clone(),
+        extra,
+    };
+
+    if !args.shard_years {
+        return Ok(vec![make_search_job("default".to_string(), base_params)?]);
+    }
+
+    let from_year = parse_year_bound("--publishyear-prev", args.publishyear_prev.as_deref())?;
+    let to_year = parse_year_bound("--publishyear-next", args.publishyear_next.as_deref())?;
+    if from_year > to_year {
+        anyhow::bail!(
+            "--publishyear-prev must be less than or equal to --publishyear-next when --shard-years is used"
+        );
+    }
+
+    let mut jobs = Vec::with_capacity((to_year - from_year + 1) as usize);
+    for year in from_year..=to_year {
+        let mut params = base_params.clone();
+        let year = year.to_string();
+        params.publishyear_prev = Some(year.clone());
+        params.publishyear_next = Some(year.clone());
+        jobs.push(make_search_job(format!("year {year}"), params)?);
+    }
+    Ok(jobs)
+}
+
+fn make_search_job(label: String, params: SearchParams) -> Result<SearchJob> {
+    let params_json = params.key_json()?;
+    let search_key = stable_search_key(&params_json);
+    Ok(SearchJob {
+        label,
+        params,
+        search_key,
+        params_json,
+    })
+}
+
+fn parse_year_bound(name: &str, value: Option<&str>) -> Result<u32> {
+    let Some(value) = value else {
+        anyhow::bail!("{name} is required when --shard-years is used");
+    };
+    value
+        .parse::<u32>()
+        .with_context(|| format!("{name} must be an unsigned year: {value}"))
+}
+
 fn crawl(args: CrawlArgs) -> Result<()> {
     let shutdown = install_shutdown_handler()?;
     let mut db = Db::open(&args.common.db)?;
@@ -362,23 +431,27 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         );
     }
 
-    let search_params = SearchParams {
-        base_url: args.base_url.clone(),
-        query: args.query.clone(),
-        catalogs: args.catalogs.clone(),
-        access: args.access.clone(),
-        publishyear_prev: args.publishyear_prev.clone(),
-        publishyear_next: args.publishyear_next.clone(),
-        sort_by: args.sort_by.clone(),
-        order: args.order.clone(),
-        extra: parse_extra_params(&args.extra_params)?,
+    let search_jobs = build_search_jobs(&args)?;
+    let search_jobs_json = if search_jobs.len() == 1 {
+        search_jobs[0].params_json.clone()
+    } else {
+        serde_json::to_string(
+            &search_jobs
+                .iter()
+                .map(|job| &job.params_json)
+                .collect::<Vec<_>>(),
+        )?
     };
-    let search_key = search_params.key_json()?;
-    db.set_meta("search_params", &search_key)?;
-    let search_key = stable_search_key(&search_key);
-    let params_json = search_params.key_json()?;
+    db.set_meta("search_params", &search_jobs_json)?;
     if !args.no_discover {
-        db.seed_search_page(&search_key, &params_json, args.start_page)?;
+        for job in &search_jobs {
+            db.seed_search_page(&job.search_key, &job.params_json, args.start_page)?;
+        }
+        eprintln!(
+            "seeded {} search shard{}",
+            search_jobs.len(),
+            if search_jobs.len() == 1 { "" } else { "s" }
+        );
     }
 
     let discovery_done = Arc::new(AtomicBool::new(args.no_discover));
@@ -465,20 +538,36 @@ fn crawl(args: CrawlArgs) -> Result<()> {
             Duration::from_millis(args.delay_ms),
             Duration::from_secs(args.timeout_secs),
         ) {
-            Ok(mut client) => run_search_discovery(
-                &args,
-                &mut db,
-                &mut client,
-                &search_params,
-                &search_key,
-                &params_json,
-                &shutdown,
-                &consecutive_transient_errors,
-                &transient_pause_until,
-                &worker_control,
-                transient_error_pause_threshold,
-                transient_error_pause,
-            ),
+            Ok(mut client) => {
+                let mut result = Ok(());
+                for job in &search_jobs {
+                    if shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    eprintln!(
+                        "discovering search shard {} ({})",
+                        job.label, job.search_key
+                    );
+                    result = run_search_discovery(
+                        &args,
+                        &mut db,
+                        &mut client,
+                        &job.params,
+                        &job.search_key,
+                        &job.params_json,
+                        &shutdown,
+                        &consecutive_transient_errors,
+                        &transient_pause_until,
+                        &worker_control,
+                        transient_error_pause_threshold,
+                        transient_error_pause,
+                    );
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                result
+            }
             Err(error) => Err(error),
         }
     };

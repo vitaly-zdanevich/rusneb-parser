@@ -41,6 +41,19 @@ Run with up to ten parallel item workers:
 cargo run -- crawl --workers 10
 ```
 
+Split a broad search into one resumable search stream per publication year:
+
+```sh
+cargo run -- crawl --catalog 25 --access open \
+  --publishyear-prev 1800 --publishyear-next 2026 --shard-years \
+  --workers 8 --max-consecutive-transport-errors 16 --transient-error-pause-secs 120
+```
+
+Equivalent rusneb.ru search filter:
+<https://rusneb.ru/search/?q=&c[]=25&access[]=open&publishyear_prev=1800&publishyear_next=2026>
+
+Each year gets a separate SQLite search checkpoint. Records already saved from earlier broad crawls are skipped by ID. If a single year still reaches the rusneb.ru pagination window limit, split it further with narrower filters.
+
 Start at five workers, allow adaptive limiting to drop as low as three, then recover after stable successful fetches:
 
 ```sh
