@@ -30,9 +30,18 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup component add rustfmt
+          rustup component add clippy
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: >
+          cargo clippy --locked --all-targets --all-features --
+          -D warnings
+          -A clippy::large_enum_variant
+          -A clippy::manual_is_multiple_of
+          -A clippy::too_many_arguments
 
       - name: Run tests
         run: cargo test --locked --all-features
