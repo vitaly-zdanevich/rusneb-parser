@@ -41,6 +41,14 @@ Run with up to ten parallel item workers:
 cargo run -- crawl --workers 10
 ```
 
+Route all rusneb HTTP requests through an SSH dynamic SOCKS tunnel:
+
+```sh
+cargo run -- crawl --ssh ubuntu@151.145.94.114 --workers 8
+```
+
+This starts `ssh -N -D 127.0.0.1:<local-port> ...` and configures the HTTP client with a `socks5h://` proxy, so rusneb connections and DNS resolution go through the SSH host. If the SSH tunnel cannot start, the crawl exits before making rusneb requests instead of falling back to the local IP.
+
 Split a broad search into one resumable search stream per publication year:
 
 ```sh
@@ -84,6 +92,12 @@ Print checkpoint state:
 
 ```sh
 cargo run -- stats
+```
+
+If a temporary rusneb.ru block leaves failed `HTTP 403` rows, wait until the site is reachable again, then reset only those rows to `pending` and rerun the same crawl command:
+
+```sh
+cargo run -- retry-failed --http-status 403
 ```
 
 Browse saved records in SQLite:

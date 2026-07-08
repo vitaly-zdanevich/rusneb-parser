@@ -18,6 +18,34 @@ pub struct Db {
     conn: Connection,
 }
 
+#[derive(Debug, Default)]
+pub struct WorkStatusSummary {
+    pub pending: u64,
+    pub in_progress: u64,
+    pub done: u64,
+    pub failed: u64,
+    pub other: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct CrawlCompletionSummary {
+    pub records: u64,
+    pub items: WorkStatusSummary,
+    pub search_pages: WorkStatusSummary,
+    pub retryable_failed_items: u64,
+    pub exhausted_failed_items: u64,
+    pub retryable_failed_search_pages: u64,
+    pub exhausted_failed_search_pages: u64,
+    pub failed_403_items: u64,
+    pub failed_403_search_pages: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct RetryFailedCounts {
+    pub items: u64,
+    pub search_pages: u64,
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -393,6 +421,137 @@ impl Db {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    pub fn crawl_completion_summary(&self, max_attempts: u32) -> Result<CrawlCompletionSummary> {
+        Ok(CrawlCompletionSummary {
+            records: self.count_records()?,
+            items: self.work_status_summary("items")?,
+            search_pages: self.work_status_summary("search_pages")?,
+            retryable_failed_items: self.count_failed_attempts("items", max_attempts, true)?,
+            exhausted_failed_items: self.count_failed_attempts("items", max_attempts, false)?,
+            retryable_failed_search_pages: self.count_failed_attempts(
+                "search_pages",
+                max_attempts,
+                true,
+            )?,
+            exhausted_failed_search_pages: self.count_failed_attempts(
+                "search_pages",
+                max_attempts,
+                false,
+            )?,
+            failed_403_items: self.conn.query_row(
+                "SELECT COUNT(*)
+                 FROM items
+                 WHERE status = 'failed'
+                   AND (last_http_status = 403 OR last_error LIKE '%HTTP 403%')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? as u64,
+            failed_403_search_pages: self.conn.query_row(
+                "SELECT COUNT(*)
+                 FROM search_pages
+                 WHERE status = 'failed'
+                   AND last_error LIKE '%HTTP 403%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? as u64,
+        })
+    }
+
+    pub fn retry_failed(&self, http_status: Option<u16>) -> Result<RetryFailedCounts> {
+        let now = now_unix();
+        let items = match http_status {
+            Some(status) => {
+                let pattern = format!("%HTTP {status}%");
+                self.conn.execute(
+                    "UPDATE items
+                     SET status = 'pending',
+                         attempts = 0,
+                         last_error = NULL,
+                         last_http_status = NULL,
+                         updated_at = ?3
+                     WHERE status = 'failed'
+                       AND (last_http_status = ?1 OR last_error LIKE ?2)",
+                    params![status as i64, pattern, now],
+                )?
+            }
+            None => self.conn.execute(
+                "UPDATE items
+                 SET status = 'pending',
+                     attempts = 0,
+                     last_error = NULL,
+                     last_http_status = NULL,
+                     updated_at = ?1
+                 WHERE status = 'failed'",
+                params![now],
+            )?,
+        };
+        let search_pages = match http_status {
+            Some(status) => {
+                let pattern = format!("%HTTP {status}%");
+                self.conn.execute(
+                    "UPDATE search_pages
+                     SET status = 'pending',
+                         attempts = 0,
+                         last_error = NULL,
+                         updated_at = ?2
+                     WHERE status = 'failed'
+                       AND last_error LIKE ?1",
+                    params![pattern, now],
+                )?
+            }
+            None => self.conn.execute(
+                "UPDATE search_pages
+                 SET status = 'pending',
+                     attempts = 0,
+                     last_error = NULL,
+                     updated_at = ?1
+                 WHERE status = 'failed'",
+                params![now],
+            )?,
+        };
+
+        Ok(RetryFailedCounts {
+            items: items as u64,
+            search_pages: search_pages as u64,
+        })
+    }
+
+    fn work_status_summary(&self, table: &str) -> Result<WorkStatusSummary> {
+        let mut summary = WorkStatusSummary::default();
+        for (status, count) in self.status_counts(table)? {
+            match status.as_str() {
+                "pending" => summary.pending = count,
+                "in_progress" => summary.in_progress = count,
+                "done" => summary.done = count,
+                "failed" => summary.failed = count,
+                _ => summary.other += count,
+            }
+        }
+        Ok(summary)
+    }
+
+    fn count_failed_attempts(
+        &self,
+        table: &str,
+        max_attempts: u32,
+        retryable: bool,
+    ) -> Result<u64> {
+        if table != "items" && table != "search_pages" {
+            anyhow::bail!("unsupported table for failed attempt count: {table}");
+        }
+        let op = if retryable { "<" } else { ">=" };
+        Ok(self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*)
+                 FROM {table}
+                 WHERE status = 'failed'
+                   AND attempts {op} ?1"
+            ),
+            params![max_attempts as i64],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
     }
 
     pub fn for_each_record<F>(&self, mut f: F) -> Result<usize>

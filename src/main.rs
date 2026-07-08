@@ -8,14 +8,16 @@ use clap::{Args, Parser, Subcommand};
 use db::Db;
 use rusneb::{RusnebClient, SearchParams};
 use std::io::BufRead;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "NЭБ/rusneb.ru metadata crawler")]
@@ -30,6 +32,8 @@ enum Command {
     Crawl(CrawlArgs),
     /// Add explicit catalog IDs to the durable crawl queue.
     EnqueueIds(EnqueueIdsArgs),
+    /// Reset failed rows to pending so the next crawl retries them.
+    RetryFailed(RetryFailedArgs),
     /// Export records stored in SQLite to JSON Lines.
     ExportJsonl(ExportJsonlArgs),
     /// Export a flattened Parquet file plus the full JSON record column.
@@ -158,6 +162,10 @@ struct CrawlArgs {
     #[arg(long, default_value = "rusneb-parser/0.1 metadata crawler")]
     user_agent: String,
 
+    /// Route all rusneb HTTP requests through this SSH dynamic SOCKS tunnel target.
+    #[arg(long)]
+    ssh: Option<String>,
+
     /// Export gzip JSONL from the SQLite records table before exit.
     #[arg(long)]
     export_jsonl: Option<PathBuf>,
@@ -175,6 +183,16 @@ struct EnqueueIdsArgs {
     /// File with one catalog ID per line.
     #[arg(long)]
     ids_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct RetryFailedArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Only retry failures with this HTTP status. Example: --http-status 403.
+    #[arg(long)]
+    http_status: Option<u16>,
 }
 
 #[derive(Debug, Args)]
@@ -213,6 +231,92 @@ struct SearchJob {
     params: SearchParams,
     search_key: String,
     params_json: String,
+}
+
+#[derive(Debug)]
+struct SshTunnel {
+    child: Child,
+    proxy_url: String,
+    target: String,
+}
+
+impl SshTunnel {
+    fn start(target: &str) -> Result<Self> {
+        let port = reserve_local_port()?;
+        let bind = format!("127.0.0.1:{port}");
+        let mut child = ProcessCommand::new("ssh")
+            .args([
+                "-N",
+                "-D",
+                &bind,
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
+                target,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("starting SSH SOCKS tunnel via {target}"))?;
+
+        let addr: SocketAddr = bind.parse().expect("valid local SSH bind address");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+                if let Some(status) = child
+                    .try_wait()
+                    .with_context(|| format!("checking SSH tunnel process for {target}"))?
+                {
+                    anyhow::bail!("SSH tunnel via {target} exited before it was ready: {status}");
+                }
+                break;
+            }
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("checking SSH tunnel process for {target}"))?
+            {
+                anyhow::bail!("SSH tunnel via {target} exited before it was ready: {status}");
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("timed out waiting for SSH tunnel via {target} on {bind}");
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let proxy_url = format!("socks5h://{bind}");
+        eprintln!("SSH tunnel ready: {target} -> {proxy_url}");
+        Ok(Self {
+            child,
+            proxy_url,
+            target: target.to_string(),
+        })
+    }
+}
+
+impl Drop for SshTunnel {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        eprintln!("SSH tunnel closed: {}", self.target);
+    }
+}
+
+fn reserve_local_port() -> Result<u16> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).context("reserving local SSH SOCKS port")?;
+    Ok(listener
+        .local_addr()
+        .context("reading local SSH SOCKS port")?
+        .port())
 }
 
 #[derive(Debug, Default)]
@@ -343,6 +447,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Crawl(args) => crawl(args),
         Command::EnqueueIds(args) => enqueue_ids(args),
+        Command::RetryFailed(args) => retry_failed(args),
         Command::ExportJsonl(args) => {
             let db = Db::open(&args.common.db)?;
             let count = export::export_jsonl(&db, &args.output)?;
@@ -473,6 +578,8 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         .or_else(|| Some((workers as u64).saturating_mul(4).max(20)))
         .filter(|limit| *limit > 0);
     let transient_error_pause = Duration::from_secs(args.transient_error_pause_secs);
+    let ssh_tunnel = args.ssh.as_deref().map(SshTunnel::start).transpose()?;
+    let proxy_url = ssh_tunnel.as_ref().map(|tunnel| tunnel.proxy_url.clone());
 
     eprintln!(
         "starting {} item worker{}{}",
@@ -501,6 +608,7 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         let timeout = Duration::from_secs(args.timeout_secs);
         let max_attempts = args.max_attempts;
         let max_items = args.max_items;
+        let proxy_url = proxy_url.clone();
 
         worker_handles.push(thread::spawn(move || {
             let shutdown_on_error = Arc::clone(&shutdown);
@@ -513,6 +621,7 @@ fn crawl(args: CrawlArgs) -> Result<()> {
                 timeout,
                 max_attempts,
                 max_items,
+                proxy_url,
                 transient_error_pause_threshold,
                 transient_error_pause,
                 shutdown,
@@ -537,6 +646,7 @@ fn crawl(args: CrawlArgs) -> Result<()> {
             &args.user_agent,
             Duration::from_millis(args.delay_ms),
             Duration::from_secs(args.timeout_secs),
+            proxy_url.as_deref(),
         ) {
             Ok(mut client) => {
                 let mut result = Ok(());
@@ -605,9 +715,20 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         worker_stats.saved, worker_stats.failed, worker_stats.deferred
     );
 
+    let completion_error = report_crawl_completion(
+        &db.crawl_completion_summary(args.max_attempts)?,
+        args.max_attempts,
+        args.max_pages.is_some() || args.max_items.is_some(),
+        shutdown.load(Ordering::SeqCst),
+    );
+
     if let Some(output) = args.export_jsonl {
         let count = export::export_jsonl(&db, &output)?;
         eprintln!("exported {count} records to {}", output.display());
+    }
+
+    if let Some(message) = completion_error {
+        anyhow::bail!(message);
     }
 
     Ok(())
@@ -728,6 +849,7 @@ fn item_worker(
     timeout: Duration,
     max_attempts: u32,
     max_items: Option<u64>,
+    proxy_url: Option<String>,
     transient_error_pause_threshold: Option<u64>,
     transient_error_pause: Duration,
     shutdown: Arc<AtomicBool>,
@@ -738,7 +860,8 @@ fn item_worker(
     worker_control: Arc<WorkerControl>,
 ) -> Result<WorkerStats> {
     let mut db = Db::open(&db_path)?;
-    let mut client = RusnebClient::new(&base_url, &user_agent, delay, timeout)?;
+    let mut client =
+        RusnebClient::new(&base_url, &user_agent, delay, timeout, proxy_url.as_deref())?;
     let mut stats = WorkerStats::default();
 
     loop {
@@ -917,11 +1040,96 @@ fn maybe_pause_after_transient_errors(
     consecutive_transient_errors.store(0, Ordering::SeqCst);
 }
 
+fn report_crawl_completion(
+    summary: &db::CrawlCompletionSummary,
+    max_attempts: u32,
+    stopped_by_limit: bool,
+    shutdown_requested: bool,
+) -> Option<String> {
+    eprintln!(
+        "crawl state: records={}, items(done={}, pending={}, in_progress={}, failed={}, retryable_failed={}, exhausted_failed={}), search_pages(done={}, pending={}, in_progress={}, failed={}, retryable_failed={}, exhausted_failed={})",
+        summary.records,
+        summary.items.done,
+        summary.items.pending,
+        summary.items.in_progress,
+        summary.items.failed,
+        summary.retryable_failed_items,
+        summary.exhausted_failed_items,
+        summary.search_pages.done,
+        summary.search_pages.pending,
+        summary.search_pages.in_progress,
+        summary.search_pages.failed,
+        summary.retryable_failed_search_pages,
+        summary.exhausted_failed_search_pages
+    );
+
+    if summary.failed_403_items > 0 || summary.failed_403_search_pages > 0 {
+        eprintln!(
+            "failed HTTP 403 rows: items={}, search_pages={}",
+            summary.failed_403_items, summary.failed_403_search_pages
+        );
+    }
+
+    let exhausted_failures = summary.exhausted_failed_items + summary.exhausted_failed_search_pages;
+    if exhausted_failures > 0 {
+        let message = format!(
+            "crawl incomplete: {} failed item(s) and {} failed search page(s) reached --max-attempts={max_attempts}",
+            summary.exhausted_failed_items, summary.exhausted_failed_search_pages
+        );
+        eprintln!("{message}");
+        eprintln!(
+            "retry exhausted failures with `rusneb-parser retry-failed --http-status 403` for HTTP 403 rows, or rerun crawl later with a higher --max-attempts"
+        );
+        return Some(message);
+    }
+
+    let unfinished = summary.items.pending
+        + summary.items.in_progress
+        + summary.retryable_failed_items
+        + summary.search_pages.pending
+        + summary.search_pages.in_progress
+        + summary.retryable_failed_search_pages;
+    if unfinished == 0 {
+        eprintln!("crawl complete: no pending or failed work remains");
+        return None;
+    }
+
+    if shutdown_requested {
+        eprintln!("crawl interrupted: rerun the same crawl command to resume pending work");
+        return None;
+    }
+
+    if stopped_by_limit {
+        eprintln!("crawl stopped by configured --max-pages or --max-items limit");
+        return None;
+    }
+
+    let message = format!("crawl incomplete: {unfinished} pending or retryable row(s) remain");
+    eprintln!("{message}");
+    Some(message)
+}
+
 fn enqueue_ids(args: EnqueueIdsArgs) -> Result<()> {
     let mut db = Db::open(&args.common.db)?;
     let ids = load_ids(&args.ids, args.ids_file.as_ref())?;
     let inserted = db.enqueue_items(None, None, &ids)?;
     eprintln!("queued {} IDs ({} new)", ids.len(), inserted);
+    Ok(())
+}
+
+fn retry_failed(args: RetryFailedArgs) -> Result<()> {
+    let db = Db::open(&args.common.db)?;
+    let counts = db.retry_failed(args.http_status)?;
+    match args.http_status {
+        Some(status) => eprintln!(
+            "reset failed HTTP {status} rows to pending: {} item(s), {} search page(s)",
+            counts.items, counts.search_pages
+        ),
+        None => eprintln!(
+            "reset all failed rows to pending: {} item(s), {} search page(s)",
+            counts.items, counts.search_pages
+        ),
+    }
     Ok(())
 }
 

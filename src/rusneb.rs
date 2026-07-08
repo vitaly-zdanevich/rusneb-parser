@@ -6,7 +6,7 @@ use crate::model::{
 use anyhow::{Context, Result};
 use html_escape::decode_html_entities;
 use regex::Regex;
-use reqwest::blocking::Client;
+use reqwest::{Proxy, blocking::Client};
 use scraper::{ElementRef, Html, Selector};
 use serde::Serialize;
 use serde_json::Value;
@@ -74,12 +74,19 @@ impl RusnebClient {
         user_agent: &str,
         delay: Duration,
         timeout: Duration,
+        proxy_url: Option<&str>,
     ) -> Result<Self> {
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .user_agent(user_agent)
             .cookie_store(true)
-            .timeout(timeout)
-            .build()?;
+            .timeout(timeout);
+        if let Some(proxy_url) = proxy_url {
+            builder = builder.proxy(
+                Proxy::all(proxy_url)
+                    .with_context(|| format!("configuring HTTP proxy {proxy_url}"))?,
+            );
+        }
+        let client = builder.build()?;
 
         Ok(Self {
             client,
