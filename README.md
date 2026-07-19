@@ -107,6 +107,15 @@ Print checkpoint state:
 cargo run -- stats
 ```
 
+Validate that completed search pages cover the result totals reported by rusneb.ru:
+
+```sh
+cargo run -- validate-coverage
+cargo run -- validate-coverage --catalog 25 --access open --require-year
+```
+
+This is an offline SQLite check. It flags unfinished search shards and shards where rusneb reported more rows than the crawler discovered, including likely pagination-window cases around 9,990 results.
+
 If a temporary rusneb.ru block leaves failed `HTTP 403` rows, wait until the site is reachable again, then reset only those rows to `pending` and rerun the same crawl command:
 
 ```sh
@@ -125,8 +134,8 @@ sqlite3 -header -column state/rusneb.sqlite \
 The GitHub Actions workflow runs tests on pushes and pull requests. Pushing any git tag builds release archives for Linux, Windows, macOS, and Android, then publishes them to GitHub Releases. The Android artifact is a raw `aarch64-linux-android` command-line binary, not an APK.
 
 ```sh
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 ## Resume Model

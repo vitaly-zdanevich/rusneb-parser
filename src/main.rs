@@ -41,6 +41,8 @@ enum Command {
     ExportParquet(ExportParquetArgs),
     /// Print durable crawl state counts.
     Stats(StatsArgs),
+    /// Validate whether completed search pages cover rusneb-reported result totals.
+    ValidateCoverage(ValidateCoverageArgs),
 }
 
 #[derive(Debug, Args)]
@@ -232,6 +234,36 @@ struct ExportParquetArgs {
 struct StatsArgs {
     #[command(flatten)]
     common: CommonArgs,
+}
+
+#[derive(Debug, Args)]
+struct ValidateCoverageArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Only validate shards whose catalog filter contains this value. Repeatable.
+    #[arg(long = "catalog")]
+    catalogs: Vec<String>,
+
+    /// Only validate shards whose access filter contains this value. Repeatable.
+    #[arg(long = "access")]
+    access: Vec<String>,
+
+    /// Only validate shards with a publication-year filter.
+    #[arg(long)]
+    require_year: bool,
+
+    /// Rows that indicate rusneb's search result window limit when a shard still has a gap.
+    #[arg(long, default_value_t = 9990)]
+    window_limit_results: u64,
+
+    /// Maximum suspicious shards to print.
+    #[arg(long, default_value_t = 50)]
+    top: usize,
+
+    /// Print every shard, including shards without coverage gaps.
+    #[arg(long)]
+    show_all: bool,
 }
 
 #[derive(Debug)]
@@ -476,6 +508,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Stats(args) => print_stats(args),
+        Command::ValidateCoverage(args) => validate_coverage(args),
     }
 }
 
@@ -1197,6 +1230,219 @@ fn print_stats(args: StatsArgs) -> Result<()> {
         println!("  {status}: {count}");
     }
     Ok(())
+}
+
+fn validate_coverage(args: ValidateCoverageArgs) -> Result<()> {
+    let db = Db::open(&args.common.db)?;
+    let report = db.coverage_report()?;
+    let shards = report
+        .shards
+        .iter()
+        .filter(|shard| coverage_shard_matches_filters(shard, &args))
+        .collect::<Vec<_>>();
+    if shards.is_empty() {
+        anyhow::bail!("coverage validation failed: no search pages found");
+    }
+
+    let unfinished_shards = shards
+        .iter()
+        .filter(|shard| shard.has_unfinished_pages())
+        .count();
+    let gap_shards = shards
+        .iter()
+        .filter(|shard| shard.has_coverage_gap())
+        .count();
+    let window_limited_shards = shards
+        .iter()
+        .filter(|shard| shard.looks_window_limited(args.window_limit_results))
+        .count();
+    let per_query_missing_results = shards
+        .iter()
+        .filter_map(|shard| shard.missing_results())
+        .sum::<u64>();
+
+    println!("search coverage:");
+    println!("  shards: {}", shards.len());
+    println!("  unfinished_shards: {unfinished_shards}");
+    println!("  gap_shards: {gap_shards}");
+    println!("  window_limited_shards: {window_limited_shards}");
+    println!("  per_query_missing_results: {per_query_missing_results}");
+
+    let mut display_shards = shards
+        .into_iter()
+        .filter(|shard| args.show_all || shard.has_unfinished_pages() || shard.has_coverage_gap())
+        .collect::<Vec<_>>();
+    display_shards.sort_by_key(|shard| {
+        std::cmp::Reverse((
+            shard.missing_results().unwrap_or(0),
+            shard.discovered_results,
+        ))
+    });
+
+    if !display_shards.is_empty() {
+        println!("shards:");
+        for shard in display_shards.iter().take(args.top) {
+            print_coverage_shard(shard, args.window_limit_results);
+        }
+        if display_shards.len() > args.top {
+            println!(
+                "  ... {} more shard(s), raise --top to print them",
+                display_shards.len() - args.top
+            );
+        }
+    }
+
+    if unfinished_shards == 0 && gap_shards == 0 {
+        println!("coverage ok: completed search pages cover all reported shard totals");
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "coverage validation failed: {unfinished_shards} unfinished shard(s), {gap_shards} shard(s) with coverage gaps"
+    )
+}
+
+fn coverage_shard_matches_filters(shard: &db::CoverageShard, args: &ValidateCoverageArgs) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&shard.params_json) else {
+        return false;
+    };
+    if !args.catalogs.is_empty() && !json_array_contains_all(&value, "catalogs", &args.catalogs) {
+        return false;
+    }
+    if !args.access.is_empty() && !json_array_contains_all(&value, "access", &args.access) {
+        return false;
+    }
+    if args.require_year
+        && json_string(&value, "publishyear_prev").is_none()
+        && json_string(&value, "publishyear_next").is_none()
+    {
+        return false;
+    }
+    true
+}
+
+fn print_coverage_shard(shard: &db::CoverageShard, window_limit_results: u64) {
+    let missing = shard.missing_results().unwrap_or(0);
+    let flags = coverage_flags(shard, window_limit_results);
+    println!(
+        "  {} | {} | pages={} done={} pending={} in_progress={} failed={} discovered={} total={:?} missing={} max_done_page={:?}{}",
+        shard.search_key,
+        coverage_shard_label(&shard.params_json),
+        shard.pages,
+        shard.done_pages,
+        shard.pending_pages,
+        shard.in_progress_pages,
+        shard.failed_pages,
+        shard.discovered_results,
+        shard.reported_total_results,
+        missing,
+        shard.max_done_page,
+        flags
+    );
+}
+
+fn coverage_flags(shard: &db::CoverageShard, window_limit_results: u64) -> String {
+    let mut flags = Vec::new();
+    if shard.has_unfinished_pages() {
+        flags.push("unfinished");
+    }
+    if shard.has_coverage_gap() {
+        flags.push("gap");
+    }
+    if shard.looks_window_limited(window_limit_results) {
+        flags.push("window-limit");
+    }
+    if flags.is_empty() {
+        String::new()
+    } else {
+        format!(" flags={}", flags.join(","))
+    }
+}
+
+fn coverage_shard_label(params_json: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(params_json) else {
+        return "<invalid params>".to_string();
+    };
+
+    let mut parts = Vec::new();
+    if let Some(query) = json_string(&value, "query").filter(|query| !query.is_empty()) {
+        parts.push(format!("q={query:?}"));
+    }
+    if let Some(catalogs) =
+        json_string_array(&value, "catalogs").filter(|values| !values.is_empty())
+    {
+        parts.push(format!("catalog={}", catalogs.join(",")));
+    }
+    if let Some(access) = json_string_array(&value, "access").filter(|values| !values.is_empty()) {
+        parts.push(format!("access={}", access.join(",")));
+    }
+    match (
+        json_string(&value, "publishyear_prev"),
+        json_string(&value, "publishyear_next"),
+    ) {
+        (Some(from), Some(to)) if from == to => parts.push(format!("year={from}")),
+        (Some(from), Some(to)) => parts.push(format!("year={from}..{to}")),
+        (Some(from), None) => parts.push(format!("year>={from}")),
+        (None, Some(to)) => parts.push(format!("year<={to}")),
+        (None, None) => {}
+    }
+    if let Some(sort_by) = json_string(&value, "sort_by") {
+        let order = json_string(&value, "order").unwrap_or_else(|| "?".to_string());
+        parts.push(format!("sort={sort_by}:{order}"));
+    }
+    if let Some(extra) = json_extra_params(&value).filter(|values| !values.is_empty()) {
+        parts.push(format!("extra={}", extra.join(",")));
+    }
+
+    if parts.is_empty() {
+        "default".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn json_string_array(value: &serde_json::Value, key: &str) -> Option<Vec<String>> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+}
+
+fn json_array_contains_all(value: &serde_json::Value, key: &str, expected: &[String]) -> bool {
+    let Some(actual) = json_string_array(value, key) else {
+        return false;
+    };
+    expected.iter().all(|value| actual.contains(value))
+}
+
+fn json_extra_params(value: &serde_json::Value) -> Option<Vec<String>> {
+    value
+        .get("extra")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let pair = item.as_array()?;
+                    let key = pair.first()?.as_str()?;
+                    let value = pair.get(1)?.as_str()?;
+                    Some(format!("{key}={value}"))
+                })
+                .collect()
+        })
 }
 
 fn install_shutdown_handler() -> Result<Arc<AtomicBool>> {

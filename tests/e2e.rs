@@ -172,6 +172,19 @@ fn crawl_persists_record_resumes_and_exports_jsonl() {
             .arg("--output")
             .arg(&output),
     );
+    let validation = run_ok(
+        Command::new(parser_bin())
+            .arg("validate-coverage")
+            .arg("--db")
+            .arg(&db)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open"),
+    );
+    let validation_stdout =
+        String::from_utf8(validation.stdout).expect("validation stdout is UTF-8");
+    assert!(validation_stdout.contains("coverage ok"));
 
     let jsonl = fs::read_to_string(&output).expect("read exported JSONL");
     let lines = jsonl.lines().collect::<Vec<_>>();
@@ -253,6 +266,23 @@ fn crawl_discovers_sorted_overflow_search_shards() {
     let stdout = String::from_utf8(stats.stdout).expect("stats stdout is UTF-8");
     assert!(stdout.contains("records: 0"));
     assert!(stdout.contains("  pending: 2"));
+
+    let validation = run_command(
+        Command::new(parser_bin())
+            .arg("validate-coverage")
+            .arg("--db")
+            .arg(&db)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--require-year"),
+    );
+    assert!(!validation.status.success());
+    let validation_stdout =
+        String::from_utf8(validation.stdout).expect("validation stdout is UTF-8");
+    assert!(validation_stdout.contains("gap_shards: 2"));
+    assert!(validation_stdout.contains("document_titlesort:desc"));
 }
 
 /// Return the test-built rusneb-parser binary path.
@@ -262,7 +292,7 @@ fn parser_bin() -> &'static Path {
 
 /// Run a command and fail with stdout/stderr context on non-zero exit.
 fn run_ok(command: &mut Command) -> Output {
-    let output = command.output().expect("run rusneb-parser command");
+    let output = run_command(command);
     if !output.status.success() {
         panic!(
             "command failed: {command:?}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -272,6 +302,11 @@ fn run_ok(command: &mut Command) -> Output {
         );
     }
     output
+}
+
+/// Run a command and return its output.
+fn run_command(command: &mut Command) -> Output {
+    command.output().expect("run rusneb-parser command")
 }
 
 /// Handle one HTTP connection from the mock rusneb client.

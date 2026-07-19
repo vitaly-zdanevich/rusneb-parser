@@ -46,6 +46,50 @@ pub struct RetryFailedCounts {
     pub search_pages: u64,
 }
 
+/// Aggregated search coverage information for all discovered search shards.
+#[derive(Debug, Default)]
+pub struct CoverageReport {
+    pub shards: Vec<CoverageShard>,
+}
+
+/// Aggregated coverage counters for one unique search parameter set.
+#[derive(Debug)]
+pub struct CoverageShard {
+    pub search_key: String,
+    pub params_json: String,
+    pub pages: u64,
+    pub done_pages: u64,
+    pub pending_pages: u64,
+    pub in_progress_pages: u64,
+    pub failed_pages: u64,
+    pub discovered_results: u64,
+    pub reported_total_results: Option<u64>,
+    pub max_done_page: Option<u64>,
+}
+
+impl CoverageShard {
+    /// Return the reported rows that were not reached by the completed pages.
+    pub fn missing_results(&self) -> Option<u64> {
+        self.reported_total_results
+            .map(|total| total.saturating_sub(self.discovered_results))
+    }
+
+    /// Return true when this shard still has search-page work not marked done.
+    pub fn has_unfinished_pages(&self) -> bool {
+        self.pending_pages > 0 || self.in_progress_pages > 0 || self.failed_pages > 0
+    }
+
+    /// Return true when completed pages do not cover the reported total.
+    pub fn has_coverage_gap(&self) -> bool {
+        self.missing_results().is_some_and(|missing| missing > 0)
+    }
+
+    /// Return true when the gap looks like rusneb's search result window limit.
+    pub fn looks_window_limited(&self, window_limit_results: u64) -> bool {
+        self.has_coverage_gap() && self.discovered_results >= window_limit_results
+    }
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -516,6 +560,46 @@ impl Db {
             items: items as u64,
             search_pages: search_pages as u64,
         })
+    }
+
+    /// Aggregate completed search pages and reported totals by search shard.
+    pub fn coverage_report(&self) -> Result<CoverageReport> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                 search_key,
+                 MIN(params_json),
+                 COUNT(*),
+                 SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END),
+                 SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END),
+                 SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END),
+                 SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END),
+                 SUM(CASE WHEN status = 'done' THEN COALESCE(result_count, 0) ELSE 0 END),
+                 MAX(total_results),
+                 MAX(CASE WHEN status = 'done' THEN page ELSE NULL END)
+             FROM search_pages
+             GROUP BY search_key
+             ORDER BY search_key",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(CoverageShard {
+                search_key: row.get(0)?,
+                params_json: row.get(1)?,
+                pages: row.get::<_, i64>(2)? as u64,
+                done_pages: row.get::<_, i64>(3)? as u64,
+                pending_pages: row.get::<_, i64>(4)? as u64,
+                in_progress_pages: row.get::<_, i64>(5)? as u64,
+                failed_pages: row.get::<_, i64>(6)? as u64,
+                discovered_results: row.get::<_, i64>(7)? as u64,
+                reported_total_results: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
+                max_done_page: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
+            })
+        })?;
+
+        let mut shards = Vec::new();
+        for row in rows {
+            shards.push(row?);
+        }
+        Ok(CoverageReport { shards })
     }
 
     fn work_status_summary(&self, table: &str) -> Result<WorkStatusSummary> {
