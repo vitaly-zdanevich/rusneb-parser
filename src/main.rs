@@ -4,10 +4,10 @@ mod model;
 mod rusneb;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use db::Db;
 use rusneb::{RusnebClient, SearchParams};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::BufRead;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::num::NonZeroUsize;
@@ -90,8 +90,17 @@ struct CrawlArgs {
     overflow_years: Vec<u32>,
 
     /// Sort shard for each --overflow-year, formatted as field:asc or field:desc. Repeatable.
+    /// Without --overflow-year, the same sort list is used for automatic overflow shards.
     #[arg(long = "overflow-sort")]
     overflow_sorts: Vec<String>,
+
+    /// Disable automatic sorted shards for year shards that hit rusneb's search result window.
+    #[arg(long = "no-auto-overflow", action = ArgAction::SetFalse, default_value_t = true)]
+    auto_overflow: bool,
+
+    /// Rows that indicate rusneb's search result window limit for automatic overflow shards.
+    #[arg(long, default_value_t = 9990)]
+    search_window_limit_results: u64,
 
     /// Search sort field. Example: document_publishyearsort.
     #[arg(long)]
@@ -266,7 +275,7 @@ struct ValidateCoverageArgs {
     show_all: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SearchJob {
     label: String,
     params: SearchParams,
@@ -514,7 +523,7 @@ fn main() -> Result<()> {
 
 fn build_search_jobs(args: &CrawlArgs) -> Result<Vec<SearchJob>> {
     let extra = parse_extra_params(&args.extra_params)?;
-    let overflow_sorts = parse_overflow_sorts(&args.overflow_sorts)?;
+    let overflow_sorts = effective_overflow_sorts(args)?;
     let base_params = SearchParams {
         base_url: args.base_url.clone(),
         query: args.query.clone(),
@@ -528,16 +537,13 @@ fn build_search_jobs(args: &CrawlArgs) -> Result<Vec<SearchJob>> {
     };
 
     if !args.shard_years {
-        if !args.overflow_years.is_empty() || !overflow_sorts.is_empty() {
+        if !args.overflow_years.is_empty() || !args.overflow_sorts.is_empty() {
             anyhow::bail!("--overflow-year and --overflow-sort require --shard-years");
         }
         return Ok(vec![make_search_job("default".to_string(), base_params)?]);
     }
-    if !args.overflow_years.is_empty() && overflow_sorts.is_empty() {
-        anyhow::bail!("--overflow-year requires at least one --overflow-sort");
-    }
-    if args.overflow_years.is_empty() && !overflow_sorts.is_empty() {
-        anyhow::bail!("--overflow-sort requires at least one --overflow-year");
+    if args.overflow_years.is_empty() && !args.auto_overflow && !args.overflow_sorts.is_empty() {
+        anyhow::bail!("--overflow-sort without --overflow-year requires automatic overflow");
     }
 
     let from_year = parse_year_bound("--publishyear-prev", args.publishyear_prev.as_deref())?;
@@ -586,6 +592,24 @@ fn build_search_jobs(args: &CrawlArgs) -> Result<Vec<SearchJob>> {
     Ok(jobs)
 }
 
+fn effective_overflow_sorts(args: &CrawlArgs) -> Result<Vec<SearchSort>> {
+    let sorts = parse_overflow_sorts(&args.overflow_sorts)?;
+    if !sorts.is_empty()
+        || !args.shard_years
+        || (!args.auto_overflow && args.overflow_years.is_empty())
+    {
+        return Ok(sorts);
+    }
+    Ok(default_overflow_sorts())
+}
+
+fn default_overflow_sorts() -> Vec<SearchSort> {
+    vec![SearchSort {
+        field: "document_titlesort".to_string(),
+        order: "desc".to_string(),
+    }]
+}
+
 fn make_search_job(label: String, params: SearchParams) -> Result<SearchJob> {
     let params_json = params.key_json()?;
     let search_key = stable_search_key(&params_json);
@@ -595,6 +619,92 @@ fn make_search_job(label: String, params: SearchParams) -> Result<SearchJob> {
         search_key,
         params_json,
     })
+}
+
+fn write_search_jobs_meta(db: &Db, search_jobs: &[SearchJob]) -> Result<()> {
+    let search_jobs_json = if search_jobs.len() == 1 {
+        search_jobs[0].params_json.clone()
+    } else {
+        serde_json::to_string(
+            &search_jobs
+                .iter()
+                .map(|job| &job.params_json)
+                .collect::<Vec<_>>(),
+        )?
+    };
+    db.set_meta("search_params", &search_jobs_json)
+}
+
+fn seed_auto_overflow_jobs(
+    args: &CrawlArgs,
+    db: &Db,
+    source_job: &SearchJob,
+    overflow_sorts: &[SearchSort],
+    queued_search_keys: &mut BTreeSet<String>,
+) -> Result<Vec<SearchJob>> {
+    if !args.auto_overflow || !args.shard_years || overflow_sorts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(year) = exact_year(&source_job.params).map(str::to_string) else {
+        return Ok(Vec::new());
+    };
+
+    let Some(shard) = db.coverage_shard(&source_job.search_key)? else {
+        return Ok(Vec::new());
+    };
+    if shard.has_unfinished_pages()
+        || !shard.ended_on_empty_done_page()
+        || !shard.looks_window_limited(args.search_window_limit_results)
+    {
+        return Ok(Vec::new());
+    }
+
+    let mut new_jobs = Vec::new();
+    for sort in overflow_sorts {
+        if source_job.params.sort_by.as_deref() == Some(sort.field.as_str())
+            && source_job.params.order.as_deref() == Some(sort.order.as_str())
+        {
+            continue;
+        }
+
+        let mut params = source_job.params.clone();
+        params.sort_by = Some(sort.field.clone());
+        params.order = Some(sort.order.clone());
+        let job = make_search_job(
+            format!(
+                "year {year} auto overflow sort {}:{}",
+                sort.field, sort.order
+            ),
+            params,
+        )?;
+
+        if queued_search_keys.insert(job.search_key.clone()) {
+            let inserted =
+                db.seed_search_page(&job.search_key, &job.params_json, args.start_page)?;
+            eprintln!(
+                "auto overflow shard {} ({}) {} after shard {} discovered {} of {:?} reported results",
+                job.label,
+                job.search_key,
+                if inserted { "seeded" } else { "queued" },
+                source_job.search_key,
+                shard.discovered_results,
+                shard.reported_total_results
+            );
+            new_jobs.push(job);
+        }
+    }
+
+    Ok(new_jobs)
+}
+
+fn exact_year(params: &SearchParams) -> Option<&str> {
+    match (
+        params.publishyear_prev.as_deref(),
+        params.publishyear_next.as_deref(),
+    ) {
+        (Some(from), Some(to)) if from == to => Some(from),
+        _ => None,
+    }
 }
 
 fn parse_year_bound(name: &str, value: Option<&str>) -> Result<u32> {
@@ -621,18 +731,9 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         );
     }
 
-    let search_jobs = build_search_jobs(&args)?;
-    let search_jobs_json = if search_jobs.len() == 1 {
-        search_jobs[0].params_json.clone()
-    } else {
-        serde_json::to_string(
-            &search_jobs
-                .iter()
-                .map(|job| &job.params_json)
-                .collect::<Vec<_>>(),
-        )?
-    };
-    db.set_meta("search_params", &search_jobs_json)?;
+    let mut search_jobs = build_search_jobs(&args)?;
+    let overflow_sorts = effective_overflow_sorts(&args)?;
+    write_search_jobs_meta(&db, &search_jobs)?;
     if !args.no_discover {
         for job in &search_jobs {
             db.seed_search_page(&job.search_key, &job.params_json, args.start_page)?;
@@ -734,8 +835,13 @@ fn crawl(args: CrawlArgs) -> Result<()> {
             proxy_url.as_deref(),
         ) {
             Ok(mut client) => {
+                let mut queued_search_keys = search_jobs
+                    .iter()
+                    .map(|job| job.search_key.clone())
+                    .collect::<BTreeSet<_>>();
+                let mut pending_jobs = VecDeque::from(search_jobs.clone());
                 let mut result = Ok(());
-                for job in &search_jobs {
+                while let Some(job) = pending_jobs.pop_front() {
                     if shutdown.load(Ordering::SeqCst) {
                         break;
                     }
@@ -759,6 +865,30 @@ fn crawl(args: CrawlArgs) -> Result<()> {
                     );
                     if result.is_err() {
                         break;
+                    }
+                    match seed_auto_overflow_jobs(
+                        &args,
+                        &db,
+                        &job,
+                        &overflow_sorts,
+                        &mut queued_search_keys,
+                    ) {
+                        Ok(new_jobs) => {
+                            if !new_jobs.is_empty() {
+                                for new_job in &new_jobs {
+                                    pending_jobs.push_back(new_job.clone());
+                                }
+                                search_jobs.extend(new_jobs);
+                                if let Err(error) = write_search_jobs_meta(&db, &search_jobs) {
+                                    result = Err(error);
+                                    break;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            result = Err(error);
+                            break;
+                        }
                     }
                 }
                 result

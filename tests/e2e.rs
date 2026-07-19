@@ -285,6 +285,74 @@ fn crawl_discovers_sorted_overflow_search_shards() {
     assert!(validation_stdout.contains("document_titlesort:desc"));
 }
 
+#[test]
+fn crawl_auto_detects_sorted_overflow_search_shards() {
+    let workspace = TempWorkspace::new("auto-overflow");
+    let server = MockRusnebServer::start(MockMode::OverflowSearch);
+    let db = workspace.join("state.sqlite");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--publishyear-prev")
+            .arg("1911")
+            .arg("--publishyear-next")
+            .arg("1911")
+            .arg("--shard-years")
+            .arg("--search-window-limit-results")
+            .arg("1")
+            .arg("--max-items")
+            .arg("0")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+
+    let requests = server.requests();
+    let search_requests = requests
+        .iter()
+        .filter(|request| request.starts_with("/search/"))
+        .collect::<Vec<_>>();
+    assert_eq!(search_requests.len(), 4);
+    assert!(search_requests.iter().any(|request| {
+        request.contains("by=document_titlesort") && request.contains("order=desc")
+    }));
+
+    let stats = run_ok(Command::new(parser_bin()).arg("stats").arg("--db").arg(&db));
+    let stdout = String::from_utf8(stats.stdout).expect("stats stdout is UTF-8");
+    assert!(stdout.contains("records: 0"));
+    assert!(stdout.contains("  pending: 2"));
+
+    let validation = run_command(
+        Command::new(parser_bin())
+            .arg("validate-coverage")
+            .arg("--db")
+            .arg(&db)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--require-year")
+            .arg("--window-limit-results")
+            .arg("1"),
+    );
+    assert!(!validation.status.success());
+    let validation_stdout =
+        String::from_utf8(validation.stdout).expect("validation stdout is UTF-8");
+    assert!(validation_stdout.contains("gap_shards: 2"));
+    assert!(validation_stdout.contains("window_limited_shards: 2"));
+    assert!(validation_stdout.contains("document_titlesort:desc"));
+}
+
 /// Return the test-built rusneb-parser binary path.
 fn parser_bin() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_rusneb-parser"))
@@ -366,6 +434,9 @@ fn route_complete_record(target: &str) -> (u16, &'static str, String) {
 fn route_overflow_search(target: &str) -> (u16, &'static str, String) {
     if !target.starts_with("/search/") {
         return (404, "text/plain; charset=utf-8", "not found".to_string());
+    }
+    if target.contains("PAGEN_1=2") {
+        return (200, "text/html; charset=utf-8", search_html(&[], 12_853));
     }
 
     let id = if target.contains("by=document_titlesort") && target.contains("order=desc") {
