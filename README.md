@@ -129,10 +129,13 @@ cargo run -- crawl --workers 3 --fixed-workers
 Export all completed records:
 
 ```sh
+./export.sh
 cargo run -- export-jsonl --output out/rusneb.jsonl.gz
 cargo run -- export-jsonl --output out/rusneb.jsonl.xz
 cargo run -- export-parquet --output out/rusneb.parquet
 ```
+
+`export.sh` writes `out/rusneb.jsonl.xz`, `out/rusneb.parquet`, `out/manifest.json`, and `out/SHA256SUMS` by default. Use `--no-parquet`, `--no-jsonl`, `--prefix`, `--out-dir`, or `--crawl-command` to adjust the export.
 
 Export a companion manifest for sharing dataset archives:
 
@@ -178,7 +181,7 @@ sqlite3 -header -column state/rusneb.sqlite \
 
 ## GitHub Releases
 
-The GitHub Actions workflow runs tests on pushes and pull requests. Pushing any git tag builds release archives for Linux, Windows, macOS, and Android, then publishes them to GitHub Releases. The Android artifact is a raw `aarch64-linux-android` command-line binary, not an APK.
+The GitHub Actions workflow runs tests on pushes and pull requests. The Sonar workflow generates `coverage/lcov.info`, uploads it as a GitHub Actions artifact, and passes it to SonarCloud. Pushing any git tag builds release archives for Linux, Windows, macOS, and Android, then publishes them to GitHub Releases. The Android artifact is a raw `aarch64-linux-android` command-line binary, not an APK.
 
 ```sh
 git tag v0.4.0
