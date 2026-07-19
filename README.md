@@ -72,7 +72,9 @@ cargo run -- crawl --catalog 25 --access open \
 Equivalent rusneb.ru search filter:
 <https://rusneb.ru/search/?q=&c[]=25&access[]=open&publishyear_prev=1800&publishyear_next=2026>
 
-Each year gets a separate SQLite search checkpoint. Records already saved from earlier broad crawls are skipped by ID. If a year shard reaches rusneb.ru's search result window, the crawler automatically seeds a sorted overflow shard with `document_titlesort:desc` and keeps going.
+Each year gets a separate SQLite search checkpoint. Records already saved from earlier broad crawls are skipped by ID. Year-sharded crawls also seed a date-ascending no-year prefix shard by default, because rusneb.ru's date sort shows records without a publication year before dated records. Use `--skip-no-year-shard` to disable it, or `--no-year-max-pages` to change its page cap.
+
+If a year shard reaches rusneb.ru's search result window, the crawler automatically seeds a sorted overflow shard with `document_titlesort:desc` and keeps going.
 
 rusneb.ru can report more than 9,990 results for one query while returning zero records after page 666. Automatic overflow shards discover the same year through a different ordering, which exposes records hidden behind that search window. SQLite still de-duplicates item IDs, so already saved records are not fetched again. Add `--overflow-sort field:asc|desc` to choose the sort used for automatic overflow shards, or `--no-auto-overflow` to disable this behavior:
 

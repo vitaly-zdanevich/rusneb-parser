@@ -12,6 +12,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MOCK_ID: &str = "mock-record-1";
+const NO_YEAR_ID: &str = "no-year-record";
 const OVERFLOW_NORMAL_ID: &str = "overflow-normal";
 const OVERFLOW_SORTED_ID: &str = "overflow-sorted";
 
@@ -22,6 +23,8 @@ enum MockMode {
     CompleteRecord,
     /// Serve two search result shards: the default year shard and one sorted overflow shard.
     OverflowSearch,
+    /// Serve a no-publication-year prefix shard plus an empty year shard.
+    NoYearSearch,
 }
 
 /// Temporary directory removed automatically when the test exits.
@@ -238,6 +241,7 @@ fn crawl_discovers_sorted_overflow_search_shards() {
             .arg("--publishyear-next")
             .arg("1911")
             .arg("--shard-years")
+            .arg("--skip-no-year-shard")
             .arg("--overflow-year")
             .arg("1911")
             .arg("--overflow-sort")
@@ -307,6 +311,7 @@ fn crawl_auto_detects_sorted_overflow_search_shards() {
             .arg("--publishyear-next")
             .arg("1911")
             .arg("--shard-years")
+            .arg("--skip-no-year-shard")
             .arg("--search-window-limit-results")
             .arg("1")
             .arg("--max-items")
@@ -351,6 +356,62 @@ fn crawl_auto_detects_sorted_overflow_search_shards() {
     assert!(validation_stdout.contains("gap_shards: 2"));
     assert!(validation_stdout.contains("window_limited_shards: 2"));
     assert!(validation_stdout.contains("document_titlesort:desc"));
+}
+
+#[test]
+fn crawl_discovers_no_year_prefix_shard() {
+    let workspace = TempWorkspace::new("no-year");
+    let server = MockRusnebServer::start(MockMode::NoYearSearch);
+    let db = workspace.join("state.sqlite");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--publishyear-prev")
+            .arg("1911")
+            .arg("--publishyear-next")
+            .arg("1911")
+            .arg("--shard-years")
+            .arg("--no-year-max-pages")
+            .arg("1")
+            .arg("--max-items")
+            .arg("0")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+
+    let requests = server.requests();
+    let search_requests = requests
+        .iter()
+        .filter(|request| request.starts_with("/search/"))
+        .collect::<Vec<_>>();
+    assert_eq!(search_requests.len(), 2);
+    assert!(search_requests.iter().any(|request| {
+        request.contains("by=document_publishyearsort")
+            && request.contains("order=asc")
+            && !request.contains("publishyear_prev")
+            && !request.contains("publishyear_next")
+    }));
+    assert!(
+        search_requests
+            .iter()
+            .all(|request| !request.contains("PAGEN_1=2"))
+    );
+
+    let stats = run_ok(Command::new(parser_bin()).arg("stats").arg("--db").arg(&db));
+    let stdout = String::from_utf8(stats.stdout).expect("stats stdout is UTF-8");
+    assert!(stdout.contains("records: 0"));
+    assert!(stdout.contains("  pending: 1"));
 }
 
 /// Return the test-built rusneb-parser binary path.
@@ -406,6 +467,7 @@ fn route_response(mode: MockMode, target: &str) -> (u16, &'static str, String) {
     match mode {
         MockMode::CompleteRecord => route_complete_record(target),
         MockMode::OverflowSearch => route_overflow_search(target),
+        MockMode::NoYearSearch => route_no_year_search(target),
     }
 }
 
@@ -445,6 +507,21 @@ fn route_overflow_search(target: &str) -> (u16, &'static str, String) {
         OVERFLOW_NORMAL_ID
     };
     (200, "text/html; charset=utf-8", search_html(&[id], 12_853))
+}
+
+/// Return the no-year-prefix mock response for a request target.
+fn route_no_year_search(target: &str) -> (u16, &'static str, String) {
+    if !target.starts_with("/search/") {
+        return (404, "text/plain; charset=utf-8", "not found".to_string());
+    }
+    if target.contains("by=document_publishyearsort") && target.contains("order=asc") {
+        return (
+            200,
+            "text/html; charset=utf-8",
+            search_html(&[NO_YEAR_ID], 42),
+        );
+    }
+    (200, "text/html; charset=utf-8", search_html(&[], 1))
 }
 
 /// Write one HTTP/1.1 response.

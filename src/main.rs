@@ -85,6 +85,14 @@ struct CrawlArgs {
     #[arg(long)]
     shard_years: bool,
 
+    /// Do not add the date-ascending shard that captures records without publication year.
+    #[arg(long = "skip-no-year-shard", action = ArgAction::SetFalse, default_value_t = true)]
+    no_year_shard: bool,
+
+    /// Maximum search pages to discover for the no-year prefix shard.
+    #[arg(long, default_value_t = 666)]
+    no_year_max_pages: u64,
+
     /// Add extra sorted search streams for this year. Repeatable; use when one year exceeds rusneb's search window.
     #[arg(long = "overflow-year")]
     overflow_years: Vec<u32>,
@@ -281,6 +289,7 @@ struct SearchJob {
     params: SearchParams,
     search_key: String,
     params_json: String,
+    max_pages: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -545,6 +554,9 @@ fn build_search_jobs(args: &CrawlArgs) -> Result<Vec<SearchJob>> {
     if args.overflow_years.is_empty() && !args.auto_overflow && !args.overflow_sorts.is_empty() {
         anyhow::bail!("--overflow-sort without --overflow-year requires automatic overflow");
     }
+    if args.no_year_shard && args.no_year_max_pages == 0 {
+        anyhow::bail!("--no-year-max-pages must be greater than zero");
+    }
 
     let from_year = parse_year_bound("--publishyear-prev", args.publishyear_prev.as_deref())?;
     let to_year = parse_year_bound("--publishyear-next", args.publishyear_next.as_deref())?;
@@ -567,6 +579,18 @@ fn build_search_jobs(args: &CrawlArgs) -> Result<Vec<SearchJob>> {
         (to_year - from_year + 1) as usize
             + overflow_years.len().saturating_mul(overflow_sorts.len()),
     );
+    if args.no_year_shard {
+        let mut params = base_params.clone();
+        params.publishyear_prev = None;
+        params.publishyear_next = None;
+        params.sort_by = Some("document_publishyearsort".to_string());
+        params.order = Some("asc".to_string());
+        jobs.push(make_limited_search_job(
+            "no-year prefix sort document_publishyearsort:asc".to_string(),
+            params,
+            Some(args.no_year_max_pages),
+        )?);
+    }
     for year in from_year..=to_year {
         let mut params = base_params.clone();
         let year_string = year.to_string();
@@ -611,6 +635,14 @@ fn default_overflow_sorts() -> Vec<SearchSort> {
 }
 
 fn make_search_job(label: String, params: SearchParams) -> Result<SearchJob> {
+    make_limited_search_job(label, params, None)
+}
+
+fn make_limited_search_job(
+    label: String,
+    params: SearchParams,
+    max_pages: Option<u64>,
+) -> Result<SearchJob> {
     let params_json = params.key_json()?;
     let search_key = stable_search_key(&params_json);
     Ok(SearchJob {
@@ -618,6 +650,7 @@ fn make_search_job(label: String, params: SearchParams) -> Result<SearchJob> {
         params,
         search_key,
         params_json,
+        max_pages,
     })
 }
 
@@ -856,6 +889,7 @@ fn crawl(args: CrawlArgs) -> Result<()> {
                         &job.params,
                         &job.search_key,
                         &job.params_json,
+                        job.max_pages,
                         &shutdown,
                         &consecutive_transient_errors,
                         &transient_pause_until,
@@ -956,6 +990,7 @@ fn run_search_discovery(
     search_params: &SearchParams,
     search_key: &str,
     params_json: &str,
+    job_max_pages: Option<u64>,
     shutdown: &AtomicBool,
     consecutive_transient_errors: &AtomicU64,
     transient_pause_until: &AtomicI64,
@@ -963,9 +998,8 @@ fn run_search_discovery(
     transient_error_pause_threshold: Option<u64>,
     transient_error_pause: Duration,
 ) -> Result<()> {
-    let last_search_page = args
-        .max_pages
-        .map(|n| args.start_page.saturating_add(n).saturating_sub(1));
+    let max_pages = min_optional_u64(args.max_pages, job_max_pages);
+    let last_search_page = max_pages.map(|n| args.start_page.saturating_add(n).saturating_sub(1));
     let backlog_target = (args.workers.get() as u64).saturating_mul(3).max(15);
 
     loop {
@@ -1052,6 +1086,14 @@ fn run_search_discovery(
     }
 
     Ok(())
+}
+
+fn min_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1677,6 +1719,7 @@ mod tests {
             "--publishyear-next",
             "1912",
             "--shard-years",
+            "--skip-no-year-shard",
             "--overflow-year",
             "1911",
             "--overflow-sort",
@@ -1705,6 +1748,41 @@ mod tests {
         );
         assert_eq!(jobs[1].params.order.as_deref(), Some("desc"));
         assert_eq!(jobs[2].params.sort_by, None);
+    }
+
+    #[test]
+    fn builds_limited_no_year_prefix_job_before_year_jobs() {
+        let cli = Cli::parse_from([
+            "rusneb-parser",
+            "crawl",
+            "--publishyear-prev",
+            "1911",
+            "--publishyear-next",
+            "1911",
+            "--shard-years",
+            "--no-year-max-pages",
+            "12",
+        ]);
+        let Command::Crawl(args) = cli.command else {
+            panic!("expected crawl command");
+        };
+
+        let jobs = build_search_jobs(&args).unwrap();
+
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(
+            jobs[0].label,
+            "no-year prefix sort document_publishyearsort:asc"
+        );
+        assert_eq!(jobs[0].params.publishyear_prev, None);
+        assert_eq!(jobs[0].params.publishyear_next, None);
+        assert_eq!(
+            jobs[0].params.sort_by.as_deref(),
+            Some("document_publishyearsort")
+        );
+        assert_eq!(jobs[0].params.order.as_deref(), Some("asc"));
+        assert_eq!(jobs[0].max_pages, Some(12));
+        assert_eq!(jobs[1].label, "year 1911");
     }
 
     #[test]

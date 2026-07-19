@@ -9,11 +9,11 @@ mkdir -p "$log_dir"
 parser=()
 if [[ -x ./target-codex/release/rusneb-parser ]] &&
   ./target-codex/release/rusneb-parser crawl --help | grep -q -- "--ssh" &&
-  ./target-codex/release/rusneb-parser crawl --help | grep -q -- "--no-auto-overflow"; then
+  ./target-codex/release/rusneb-parser crawl --help | grep -q -- "--skip-no-year-shard"; then
   parser=(./target-codex/release/rusneb-parser)
 elif [[ -x ./target/release/rusneb-parser ]] &&
   ./target/release/rusneb-parser crawl --help | grep -q -- "--ssh" &&
-  ./target/release/rusneb-parser crawl --help | grep -q -- "--no-auto-overflow"; then
+  ./target/release/rusneb-parser crawl --help | grep -q -- "--skip-no-year-shard"; then
   parser=(./target/release/rusneb-parser)
 else
   parser=(cargo run --release --)
