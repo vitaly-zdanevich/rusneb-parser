@@ -9,6 +9,8 @@ ssh_target="${RUSNEB_SSH-ubuntu@151.145.94.114}"
 workers="${RUSNEB_WORKERS:-8}"
 force="${RUSNEB_FORCE:-0}"
 init_db="${RUSNEB_INIT_DB:-0}"
+validate_coverage="${RUSNEB_VALIDATE_COVERAGE:-1}"
+validate_top="${RUSNEB_VALIDATE_TOP:-50}"
 lock_dir=""
 crawler_started=0
 
@@ -24,12 +26,16 @@ Options:
   --workers N     Maximum item workers [default: 8]
   --log-dir PATH  Directory for per-run logs [default: run-logs]
   --init-db       Allow creating a missing SQLite database
+  --no-validate   Do not run final stats and coverage validation after the crawl exits
+  --validate-top N
+                  Maximum suspicious coverage shards/groups to print [default: 50]
   --force         Ignore an existing crawler lock for the same SQLite database
   -h, --help      Show this help
 
 Environment overrides:
   RUSNEB_DB, RUSNEB_SSH, RUSNEB_WORKERS, RUSNEB_LOG_DIR,
-  RUSNEB_INIT_DB=1, RUSNEB_FORCE=1
+  RUSNEB_INIT_DB=1, RUSNEB_FORCE=1, RUSNEB_VALIDATE_COVERAGE=0,
+  RUSNEB_VALIDATE_TOP
 USAGE
 }
 
@@ -52,7 +58,7 @@ pid_is_running() {
 # Remove a stale lock directory created by this script.
 remove_lock_dir() {
   [[ -n "$lock_dir" && -d "$lock_dir" ]] || return 0
-  rm -f "$lock_dir/pid" "$lock_dir/db" "$lock_dir/log" "$lock_dir/started_at"
+  rm -f "$lock_dir/pid" "$lock_dir/crawler_pid" "$lock_dir/db" "$lock_dir/log" "$lock_dir/started_at"
   rmdir "$lock_dir"
 }
 
@@ -97,6 +103,15 @@ while [[ $# -gt 0 ]]; do
       init_db=1
       shift
       ;;
+    --no-validate)
+      validate_coverage=0
+      shift
+      ;;
+    --validate-top)
+      [[ $# -ge 2 ]] || die "--validate-top requires a number"
+      validate_top="$2"
+      shift 2
+      ;;
     --force)
       force=1
       shift
@@ -114,6 +129,8 @@ done
 is_positive_integer "$workers" || die "--workers must be a positive integer"
 [[ "$force" == 0 || "$force" == 1 ]] || die "RUSNEB_FORCE must be 0 or 1"
 [[ "$init_db" == 0 || "$init_db" == 1 ]] || die "RUSNEB_INIT_DB must be 0 or 1"
+[[ "$validate_coverage" == 0 || "$validate_coverage" == 1 ]] || die "RUSNEB_VALIDATE_COVERAGE must be 0 or 1"
+is_positive_integer "$validate_top" || die "--validate-top must be a positive integer"
 [[ -n "$db_path" ]] || die "--db must not be empty"
 [[ -n "$log_dir" ]] || die "--log-dir must not be empty"
 
@@ -155,7 +172,7 @@ parser=()
 parser_supports_required_options() {
   local help
   help="$("$@" crawl --help)"
-  [[ "$help" == *"--ssh"* && "$help" == *"--skip-no-year-shard"* ]]
+  [[ "$help" == *"--ssh"* && "$help" == *"--skip-no-year-shard"* && "$help" == *"--no-year-stop-after-known-pages"* ]]
 }
 
 if [[ -x ./target-codex/release/rusneb-parser ]] &&
@@ -208,17 +225,93 @@ if [[ -n "$ssh_target" ]]; then
   crawl_args+=(--ssh "$ssh_target")
 fi
 
-nohup "${parser[@]}" "${crawl_args[@]}" >> "$log_file" 2>&1 &
+nohup bash -c '
+set -uo pipefail
+
+db_abs=$1
+lock_dir=$2
+validate_coverage=$3
+validate_top=$4
+shift 4
+
+parser=()
+while [[ $# -gt 0 && "$1" != "--" ]]; do
+  parser+=("$1")
+  shift
+done
+shift
+crawl_args=("$@")
+crawler_pid=""
+
+cleanup_lock() {
+  rm -f "$lock_dir/pid" "$lock_dir/crawler_pid" "$lock_dir/db" "$lock_dir/log" "$lock_dir/started_at"
+  rmdir "$lock_dir" 2>/dev/null || true
+}
+
+stop_crawler() {
+  echo "Runner received a stop signal at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ "$crawler_pid" =~ ^[0-9]+$ ]] && kill -0 "$crawler_pid" 2>/dev/null; then
+    kill -INT "$crawler_pid" 2>/dev/null || true
+    wait "$crawler_pid"
+  fi
+  cleanup_lock
+  exit 130
+}
+
+trap stop_crawler INT TERM
+
+echo "Crawler started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+"${parser[@]}" "${crawl_args[@]}" &
+crawler_pid=$!
+printf "%s\n" "$crawler_pid" > "$lock_dir/crawler_pid"
+echo "Crawler child PID: $crawler_pid"
+
+wait "$crawler_pid"
+crawl_status=$?
+trap - INT TERM
+
+echo "Crawler exited at $(date -u +%Y-%m-%dT%H:%M:%SZ) with status $crawl_status"
+
+final_status=$crawl_status
+if [[ "$validate_coverage" == 1 ]]; then
+  echo
+  echo "Final crawler stats:"
+  "${parser[@]}" stats --db "$db_abs"
+  stats_status=$?
+  if [[ "$stats_status" -ne 0 && "$final_status" -eq 0 ]]; then
+    final_status=$stats_status
+  fi
+
+  echo
+  echo "Final coverage validation:"
+  "${parser[@]}" validate-coverage --db "$db_abs" --catalog 25 --access open --require-year --top "$validate_top"
+  validation_status=$?
+  if [[ "$validation_status" -ne 0 && "$final_status" -eq 0 ]]; then
+    final_status=$validation_status
+  fi
+else
+  echo "Final coverage validation disabled."
+fi
+
+echo "Run finished at $(date -u +%Y-%m-%dT%H:%M:%SZ) with status $final_status"
+cleanup_lock
+exit "$final_status"
+' rusneb-continue-runner "$db_abs" "$lock_dir" "$validate_coverage" "$validate_top" "${parser[@]}" -- "${crawl_args[@]}" >> "$log_file" 2>&1 &
 crawl_pid=$!
 crawler_started=1
 printf '%s\n' "$crawl_pid" > "$pid_file"
 printf '%s\n' "$crawl_pid" > "$lock_dir/pid"
 
-echo "Started rusneb crawl as PID $crawl_pid"
+echo "Started rusneb crawl runner as PID $crawl_pid"
 echo "Database: $db_abs"
 echo "Lock: $lock_dir"
 echo "Log: $log_file"
 echo "Latest log symlink: $latest_log"
+if [[ "$validate_coverage" == 1 ]]; then
+  echo "Final validation: enabled (--top $validate_top)"
+else
+  echo "Final validation: disabled"
+fi
 if [[ -n "$ssh_target" ]]; then
   echo "SSH: $ssh_target"
 else
