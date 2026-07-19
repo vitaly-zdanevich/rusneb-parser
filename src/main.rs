@@ -387,6 +387,7 @@ fn reserve_local_port() -> Result<u16> {
 #[derive(Debug, Default)]
 struct WorkerStats {
     saved: u64,
+    missing: u64,
     failed: u64,
     deferred: u64,
 }
@@ -942,6 +943,7 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         match handle.join() {
             Ok(Ok(stats)) => {
                 worker_stats.saved += stats.saved;
+                worker_stats.missing += stats.missing;
                 worker_stats.failed += stats.failed;
                 worker_stats.deferred += stats.deferred;
             }
@@ -960,8 +962,8 @@ fn crawl(args: CrawlArgs) -> Result<()> {
     }
 
     eprintln!(
-        "item workers stopped: saved={}, failed={}, deferred={}",
-        worker_stats.saved, worker_stats.failed, worker_stats.deferred
+        "item workers stopped: saved={}, missing={}, failed={}, deferred={}",
+        worker_stats.saved, worker_stats.missing, worker_stats.failed, worker_stats.deferred
     );
 
     let completion_error = report_crawl_completion(
@@ -1190,6 +1192,10 @@ fn item_worker(
                         &consecutive_transient_errors,
                         &transient_pause_until,
                     );
+                } else if is_missing_item_failure(error.status) {
+                    db.mark_item_missing(&item.id, &error.message, error.status)?;
+                    stats.missing += 1;
+                    eprintln!("worker {worker_id}: missing {}: {}", item.id, error.message);
                 } else {
                     db.fail_item(&item.id, &error.message, error.status)?;
                     stats.failed += 1;
@@ -1234,6 +1240,10 @@ fn log_record_title(record: &model::RusnebRecord) -> String {
         .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|title| !title.is_empty())
         .unwrap_or_else(|| "<no title>".to_string())
+}
+
+fn is_missing_item_failure(status: Option<u16>) -> bool {
+    status == Some(404)
 }
 
 fn is_transient_failure(status: Option<u16>) -> bool {
@@ -1304,9 +1314,10 @@ fn report_crawl_completion(
     shutdown_requested: bool,
 ) -> Option<String> {
     eprintln!(
-        "crawl state: records={}, items(done={}, pending={}, in_progress={}, failed={}, retryable_failed={}, exhausted_failed={}), search_pages(done={}, pending={}, in_progress={}, failed={}, retryable_failed={}, exhausted_failed={})",
+        "crawl state: records={}, items(done={}, missing={}, pending={}, in_progress={}, failed={}, retryable_failed={}, exhausted_failed={}), search_pages(done={}, pending={}, in_progress={}, failed={}, retryable_failed={}, exhausted_failed={})",
         summary.records,
         summary.items.done,
+        summary.items.missing,
         summary.items.pending,
         summary.items.in_progress,
         summary.items.failed,

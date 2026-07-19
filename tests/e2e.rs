@@ -12,6 +12,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MOCK_ID: &str = "mock-record-1";
+const MISSING_ID: &str = "missing-record";
 const NO_YEAR_ID: &str = "no-year-record";
 const OVERFLOW_NORMAL_ID: &str = "overflow-normal";
 const OVERFLOW_SORTED_ID: &str = "overflow-sorted";
@@ -21,6 +22,8 @@ const OVERFLOW_SORTED_ID: &str = "overflow-sorted";
 enum MockMode {
     /// Serve one complete record with search, card, MARC XML, and viewer JSON endpoints.
     CompleteRecord,
+    /// Serve one search result whose card page returns HTTP 404.
+    MissingRecord,
     /// Serve two search result shards: the default year shard and one sorted overflow shard.
     OverflowSearch,
     /// Serve a no-publication-year prefix shard plus an empty year shard.
@@ -217,6 +220,59 @@ fn crawl_persists_record_resumes_and_exports_jsonl() {
     assert_eq!(record["viewer_access"]["access"], true);
     assert!(record["viewer_access"].get("token").is_none());
     assert!(record["viewer_access"].get("viewer").is_none());
+}
+
+#[test]
+fn crawl_marks_card_404_as_terminal_missing() {
+    let workspace = TempWorkspace::new("missing");
+    let server = MockRusnebServer::start(MockMode::MissingRecord);
+    let db = workspace.join("state.sqlite");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--max-pages")
+            .arg("1")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+    assert_eq!(server.requests().len(), 2);
+
+    let stats = run_ok(Command::new(parser_bin()).arg("stats").arg("--db").arg(&db));
+    let stdout = String::from_utf8(stats.stdout).expect("stats stdout is UTF-8");
+    assert!(stdout.contains("records: 0"));
+    assert!(stdout.contains("  missing: 1"));
+    assert!(!stdout.contains("  failed: 1"));
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--max-pages")
+            .arg("1")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+    assert_eq!(server.requests().len(), 2);
 }
 
 #[test]
@@ -466,6 +522,7 @@ fn handle_connection(mut stream: TcpStream, mode: MockMode, requests: Arc<Mutex<
 fn route_response(mode: MockMode, target: &str) -> (u16, &'static str, String) {
     match mode {
         MockMode::CompleteRecord => route_complete_record(target),
+        MockMode::MissingRecord => route_missing_record(target),
         MockMode::OverflowSearch => route_overflow_search(target),
         MockMode::NoYearSearch => route_no_year_search(target),
     }
@@ -488,6 +545,21 @@ fn route_complete_record(target: &str) -> (u16, &'static str, String) {
             "application/json; charset=utf-8",
             r#"{"access":true,"token":"secret","viewer":{"token":"secret"}}"#.to_string(),
         );
+    }
+    (404, "text/plain; charset=utf-8", "not found".to_string())
+}
+
+/// Return the missing-record mock response for a request target.
+fn route_missing_record(target: &str) -> (u16, &'static str, String) {
+    if target.starts_with("/search/") {
+        return (
+            200,
+            "text/html; charset=utf-8",
+            search_html(&[MISSING_ID], 1),
+        );
+    }
+    if target == format!("/catalog/{MISSING_ID}/") {
+        return (404, "text/plain; charset=utf-8", "missing".to_string());
     }
     (404, "text/plain; charset=utf-8", "not found".to_string())
 }

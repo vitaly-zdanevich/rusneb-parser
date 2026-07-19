@@ -23,6 +23,7 @@ pub struct WorkStatusSummary {
     pub pending: u64,
     pub in_progress: u64,
     pub done: u64,
+    pub missing: u64,
     pub failed: u64,
     pub other: u64,
 }
@@ -416,6 +417,25 @@ impl Db {
         Ok(())
     }
 
+    /// Mark an item as terminally missing after rusneb returns HTTP 404 for its card page.
+    pub fn mark_item_missing(&self, id: &str, error: &str, http_status: Option<u16>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items
+             SET status = 'missing',
+                 last_error = ?2,
+                 last_http_status = ?3,
+                 updated_at = ?4
+             WHERE id = ?1",
+            params![
+                id,
+                error,
+                http_status.map(|status| status as i64),
+                now_unix()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn defer_item_after_transient_error(
         &self,
         id: &str,
@@ -663,6 +683,7 @@ impl Db {
                 "pending" => summary.pending = count,
                 "in_progress" => summary.in_progress = count,
                 "done" => summary.done = count,
+                "missing" => summary.missing = count,
                 "failed" => summary.failed = count,
                 _ => summary.other += count,
             }

@@ -159,13 +159,15 @@ The default state file is `state/rusneb.sqlite`. On crawl startup, any `in_progr
 
 Each saved record and its item status are committed in one transaction. Search pages and item IDs are de-duplicated by primary keys.
 
+If an item card returns `HTTP 404`, the item is stored with terminal status `missing`. Missing items stay visible in `stats`, are not retried on resume, and do not make an otherwise complete crawl fail.
+
 ## Why SQLite Instead of Plain Text
 
 SQLite is used for crawler state, not as the final data format. The final dataset can still be exported as JSON Lines or Parquet.
 
 A plain text file works well for append-only output, but it is a poor fit for a durable crawl queue:
 
-- crash recovery needs to know which search pages and item cards are `pending`, `in_progress`, `done`, or `failed`;
+- crash recovery needs to know which search pages and item cards are `pending`, `in_progress`, `done`, `missing`, or `failed`;
 - item IDs are discovered repeatedly across search pages, so the crawler needs cheap de-duplication;
 - a saved record and its queue status must be committed together, otherwise a power loss can create mismatches;
 - retry counters, error messages, timestamps, and search-page checkpoints need to be updated in place;
