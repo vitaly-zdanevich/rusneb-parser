@@ -96,6 +96,15 @@ Start at five workers, allow adaptive limiting to drop as low as three, then rec
 cargo run -- crawl --workers 5 --min-workers 3
 ```
 
+Resume the long books crawl with the checked-in operational wrapper:
+
+```sh
+./continue.sh
+./continue.sh --workers 8 --ssh ubuntu@151.145.94.114
+```
+
+`continue.sh` uses strict Bash mode, refuses to create a missing SQLite database unless `--init-db` is passed, writes a timestamped log under `run-logs/`, and creates a database-specific lock directory next to the SQLite file. If a stale lock remains after a crash, the next run removes it; use `--force` only when you have checked that no crawler is still using the same database.
+
 For unreliable network/server periods, tune the automatic transient-error pause threshold:
 
 ```sh
