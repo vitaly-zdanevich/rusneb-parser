@@ -19,6 +19,9 @@ const FORBIDDEN_ID: &str = "forbidden-record";
 const NO_YEAR_ID: &str = "no-year-record";
 const OVERFLOW_NORMAL_ID: &str = "overflow-normal";
 const OVERFLOW_SORTED_ID: &str = "overflow-sorted";
+const OVERFLOW_LANG_A_ID: &str = "overflow-lang-a";
+const OVERFLOW_LANG_B_ID: &str = "overflow-lang-b";
+const OVERFLOW_LANG_C_ID: &str = "overflow-lang-c";
 
 /// End-to-end mock behavior used by the local rusneb HTTP server.
 #[derive(Clone, Copy)]
@@ -35,8 +38,14 @@ enum MockMode {
     Search403ThenOk,
     /// Serve two search result shards: the default year shard and one sorted overflow shard.
     OverflowSearch,
+    /// Serve overlapping overflow shards whose combined unique IDs cover the reported total.
+    OverflowSearchCompleteUnion,
+    /// Serve sorted shards that stay incomplete until advanced-search facet shards are added.
+    OverflowFacetSearch,
     /// Serve a no-publication-year prefix shard plus an empty year shard.
     NoYearSearch,
+    /// Serve a no-year prefix shard that only repeats IDs already discovered by year shards.
+    NoYearKnownStop,
 }
 
 /// Temporary directory removed automatically when the test exits.
@@ -201,6 +210,7 @@ fn crawl_persists_record_resumes_and_exports_jsonl() {
     let validation_stdout =
         String::from_utf8(validation.stdout).expect("validation stdout is UTF-8");
     assert!(validation_stdout.contains("coverage ok"));
+    assert_eq!(search_item_count(&db), 1);
 
     run_ok(
         Command::new(parser_bin())
@@ -676,6 +686,7 @@ fn crawl_auto_detects_sorted_overflow_search_shards() {
             .arg("--skip-no-year-shard")
             .arg("--search-window-limit-results")
             .arg("1")
+            .arg("--no-auto-overflow-facets")
             .arg("--max-items")
             .arg("0")
             .arg("--workers")
@@ -689,9 +700,15 @@ fn crawl_auto_detects_sorted_overflow_search_shards() {
         .iter()
         .filter(|request| request.starts_with("/search/"))
         .collect::<Vec<_>>();
-    assert_eq!(search_requests.len(), 4);
+    assert_eq!(search_requests.len(), 14);
     assert!(search_requests.iter().any(|request| {
         request.contains("by=document_titlesort") && request.contains("order=desc")
+    }));
+    assert!(search_requests.iter().any(|request| {
+        request.contains("by=document_authorsort") && request.contains("order=asc")
+    }));
+    assert!(search_requests.iter().any(|request| {
+        request.contains("by=document_authorsort") && request.contains("order=desc")
     }));
 
     let stats = run_ok(Command::new(parser_bin()).arg("stats").arg("--db").arg(&db));
@@ -715,9 +732,244 @@ fn crawl_auto_detects_sorted_overflow_search_shards() {
     assert!(!validation.status.success());
     let validation_stdout =
         String::from_utf8(validation.stdout).expect("validation stdout is UTF-8");
-    assert!(validation_stdout.contains("gap_shards: 2"));
-    assert!(validation_stdout.contains("window_limited_shards: 2"));
+    assert!(validation_stdout.contains("gap_shards: 7"));
+    assert!(validation_stdout.contains("window_limited_shards: 7"));
+    assert!(validation_stdout.contains("gap_groups: 1"));
     assert!(validation_stdout.contains("document_titlesort:desc"));
+}
+
+#[test]
+fn crawl_auto_detects_small_coverage_gap_overflow_search_shards() {
+    let workspace = TempWorkspace::new("small-gap-overflow");
+    let server = MockRusnebServer::start(MockMode::OverflowSearchCompleteUnion);
+    let db = workspace.join("state.sqlite");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--publishyear-prev")
+            .arg("1911")
+            .arg("--publishyear-next")
+            .arg("1911")
+            .arg("--shard-years")
+            .arg("--skip-no-year-shard")
+            .arg("--max-items")
+            .arg("0")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+
+    let requests = server.requests();
+    let search_requests = requests
+        .iter()
+        .filter(|request| request.starts_with("/search/"))
+        .collect::<Vec<_>>();
+    assert_eq!(search_requests.len(), 14);
+    assert!(search_requests.iter().any(|request| {
+        request.contains("by=document_titlesort") && request.contains("order=desc")
+    }));
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.starts_with("/search/extended/"))
+    );
+
+    let validation = run_ok(
+        Command::new(parser_bin())
+            .arg("validate-coverage")
+            .arg("--db")
+            .arg(&db)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--require-year"),
+    );
+    let stdout = String::from_utf8(validation.stdout).expect("validation stdout is UTF-8");
+    assert!(stdout.contains("gap_groups: 0"));
+    assert!(stdout.contains("coverage ok"));
+}
+
+#[test]
+fn crawl_auto_detects_facet_overflow_after_sorted_gap() {
+    let workspace = TempWorkspace::new("facet-overflow");
+    let server = MockRusnebServer::start(MockMode::OverflowFacetSearch);
+    let db = workspace.join("state.sqlite");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--publishyear-prev")
+            .arg("1911")
+            .arg("--publishyear-next")
+            .arg("1911")
+            .arg("--shard-years")
+            .arg("--skip-no-year-shard")
+            .arg("--overflow-facet")
+            .arg("lang")
+            .arg("--max-items")
+            .arg("0")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+
+    let requests = server.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.starts_with("/search/extended/"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("lang=facet-a"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("lang=facet-b"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("lang=facet-c"))
+    );
+
+    let validation = run_ok(
+        Command::new(parser_bin())
+            .arg("validate-coverage")
+            .arg("--db")
+            .arg(&db)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--require-year")
+            .arg("--overflow-facet")
+            .arg("lang"),
+    );
+    let stdout = String::from_utf8(validation.stdout).expect("validation stdout is UTF-8");
+    assert!(stdout.contains("gap_groups: 0"));
+    assert!(stdout.contains("coverage ok"));
+    assert_eq!(search_item_count(&db), 10);
+}
+
+#[test]
+fn validate_coverage_accepts_complete_overflow_group_union() {
+    let workspace = TempWorkspace::new("overflow-union");
+    let server = MockRusnebServer::start(MockMode::OverflowSearchCompleteUnion);
+    let db = workspace.join("state.sqlite");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--publishyear-prev")
+            .arg("1911")
+            .arg("--publishyear-next")
+            .arg("1911")
+            .arg("--shard-years")
+            .arg("--skip-no-year-shard")
+            .arg("--overflow-year")
+            .arg("1911")
+            .arg("--overflow-sort")
+            .arg("document_titlesort:desc")
+            .arg("--max-pages")
+            .arg("1")
+            .arg("--max-items")
+            .arg("0")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+
+    let validation = run_ok(
+        Command::new(parser_bin())
+            .arg("validate-coverage")
+            .arg("--db")
+            .arg(&db)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--require-year"),
+    );
+    let stdout = String::from_utf8(validation.stdout).expect("validation stdout is UTF-8");
+    assert!(stdout.contains("gap_shards: 2"));
+    assert!(stdout.contains("gap_groups: 0"));
+    assert!(stdout.contains("coverage ok"));
+    assert_eq!(search_item_count(&db), 2);
+}
+
+#[test]
+fn validate_coverage_falls_back_to_page_counts_without_memberships() {
+    let workspace = TempWorkspace::new("legacy-coverage");
+    let server = MockRusnebServer::start(MockMode::CompleteRecord);
+    let db = workspace.join("state.sqlite");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--max-pages")
+            .arg("1")
+            .arg("--max-items")
+            .arg("0")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+    clear_search_items(&db);
+
+    let validation = run_ok(
+        Command::new(parser_bin())
+            .arg("validate-coverage")
+            .arg("--db")
+            .arg(&db)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open"),
+    );
+    let stdout = String::from_utf8(validation.stdout).expect("validation stdout is UTF-8");
+    assert!(stdout.contains("gap_groups: 0"));
+    assert!(stdout.contains("coverage ok"));
 }
 
 #[test]
@@ -744,6 +996,7 @@ fn crawl_discovers_no_year_prefix_shard() {
             .arg("--shard-years")
             .arg("--no-year-max-pages")
             .arg("1")
+            .arg("--no-auto-overflow-facets")
             .arg("--max-items")
             .arg("0")
             .arg("--workers")
@@ -757,23 +1010,78 @@ fn crawl_discovers_no_year_prefix_shard() {
         .iter()
         .filter(|request| request.starts_with("/search/"))
         .collect::<Vec<_>>();
-    assert_eq!(search_requests.len(), 2);
+    assert_eq!(search_requests.len(), 8);
     assert!(search_requests.iter().any(|request| {
         request.contains("by=document_publishyearsort")
             && request.contains("order=asc")
             && !request.contains("publishyear_prev")
             && !request.contains("publishyear_next")
     }));
-    assert!(
-        search_requests
-            .iter()
-            .all(|request| !request.contains("PAGEN_1=2"))
-    );
+    assert!(search_requests.iter().all(|request| {
+        !(request.contains("by=document_publishyearsort")
+            && request.contains("order=asc")
+            && request.contains("PAGEN_1=2"))
+    }));
 
     let stats = run_ok(Command::new(parser_bin()).arg("stats").arg("--db").arg(&db));
     let stdout = String::from_utf8(stats.stdout).expect("stats stdout is UTF-8");
     assert!(stdout.contains("records: 0"));
     assert!(stdout.contains("  pending: 1"));
+}
+
+#[test]
+fn crawl_stops_no_year_prefix_after_known_pages() {
+    let workspace = TempWorkspace::new("no-year-known-stop");
+    let server = MockRusnebServer::start(MockMode::NoYearKnownStop);
+    let db = workspace.join("state.sqlite");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--publishyear-prev")
+            .arg("1911")
+            .arg("--publishyear-next")
+            .arg("1911")
+            .arg("--shard-years")
+            .arg("--no-year-max-pages")
+            .arg("5")
+            .arg("--no-year-stop-after-known-pages")
+            .arg("1")
+            .arg("--no-auto-overflow-facets")
+            .arg("--max-items")
+            .arg("0")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+
+    let requests = server.requests();
+    let search_requests = requests
+        .iter()
+        .filter(|request| request.starts_with("/search/"))
+        .collect::<Vec<_>>();
+    assert_eq!(search_requests.len(), 3);
+    assert!(search_requests.iter().any(|request| {
+        request.contains("by=document_publishyearsort")
+            && request.contains("order=asc")
+            && !request.contains("publishyear_prev")
+            && !request.contains("publishyear_next")
+    }));
+    assert!(search_requests.iter().all(|request| {
+        !(request.contains("by=document_publishyearsort")
+            && request.contains("order=asc")
+            && request.contains("PAGEN_1=2"))
+    }));
+    assert_eq!(search_item_count(&db), 2);
 }
 
 /// Return the test-built rusneb-parser binary path.
@@ -838,7 +1146,10 @@ fn route_response(
         MockMode::ForbiddenCard403 => route_forbidden_card_403(target),
         MockMode::Search403ThenOk => route_search_403_then_ok(target, request_number),
         MockMode::OverflowSearch => route_overflow_search(target),
+        MockMode::OverflowSearchCompleteUnion => route_overflow_complete_union_search(target),
+        MockMode::OverflowFacetSearch => route_overflow_facet_search(target),
         MockMode::NoYearSearch => route_no_year_search(target),
+        MockMode::NoYearKnownStop => route_no_year_known_stop_search(target),
     }
 }
 
@@ -936,17 +1247,110 @@ fn route_overflow_search(target: &str) -> (u16, &'static str, String) {
     (200, "text/html; charset=utf-8", search_html(&[id], 12_853))
 }
 
+/// Return overflow shard pages that are incomplete individually but complete as one group.
+fn route_overflow_complete_union_search(target: &str) -> (u16, &'static str, String) {
+    if !target.starts_with("/search/") {
+        return (404, "text/plain; charset=utf-8", "not found".to_string());
+    }
+    if target.contains("PAGEN_1=2") {
+        return (200, "text/html; charset=utf-8", search_html(&[], 2));
+    }
+
+    let id = if target.contains("by=document_titlesort") && target.contains("order=desc") {
+        OVERFLOW_SORTED_ID
+    } else {
+        OVERFLOW_NORMAL_ID
+    };
+    (200, "text/html; charset=utf-8", search_html(&[id], 2))
+}
+
+/// Return search pages where generated facet shards are needed to close the coverage gap.
+fn route_overflow_facet_search(target: &str) -> (u16, &'static str, String) {
+    if target.starts_with("/search/extended/") {
+        return (
+            200,
+            "text/html; charset=utf-8",
+            advanced_filter_html(&[
+                ("lang", "facet-a"),
+                ("lang", "facet-b"),
+                ("lang", "facet-c"),
+            ]),
+        );
+    }
+    if !target.starts_with("/search/") {
+        return (404, "text/plain; charset=utf-8", "not found".to_string());
+    }
+
+    if target.contains("lang=facet-a") {
+        return facet_search_response(target, OVERFLOW_LANG_A_ID);
+    }
+    if target.contains("lang=facet-b") {
+        return facet_search_response(target, OVERFLOW_LANG_B_ID);
+    }
+    if target.contains("lang=facet-c") {
+        return facet_search_response(target, OVERFLOW_LANG_C_ID);
+    }
+    if target.contains("PAGEN_1=2") {
+        return (200, "text/html; charset=utf-8", search_html(&[], 4));
+    }
+    (
+        200,
+        "text/html; charset=utf-8",
+        search_html(&[OVERFLOW_NORMAL_ID], 4),
+    )
+}
+
+/// Return one complete facet shard page pair.
+fn facet_search_response(target: &str, id: &str) -> (u16, &'static str, String) {
+    if target.contains("PAGEN_1=2") {
+        return (200, "text/html; charset=utf-8", search_html(&[], 1));
+    }
+    (200, "text/html; charset=utf-8", search_html(&[id], 1))
+}
+
 /// Return the no-year-prefix mock response for a request target.
 fn route_no_year_search(target: &str) -> (u16, &'static str, String) {
     if !target.starts_with("/search/") {
         return (404, "text/plain; charset=utf-8", "not found".to_string());
     }
-    if target.contains("by=document_publishyearsort") && target.contains("order=asc") {
+    if target.contains("by=document_publishyearsort")
+        && target.contains("order=asc")
+        && !target.contains("publishyear_prev")
+        && !target.contains("publishyear_next")
+    {
         return (
             200,
             "text/html; charset=utf-8",
             search_html(&[NO_YEAR_ID], 42),
         );
+    }
+    (200, "text/html; charset=utf-8", search_html(&[], 1))
+}
+
+/// Return a year shard followed by a no-year shard that repeats known IDs.
+fn route_no_year_known_stop_search(target: &str) -> (u16, &'static str, String) {
+    if !target.starts_with("/search/") {
+        return (404, "text/plain; charset=utf-8", "not found".to_string());
+    }
+    if target.contains("by=document_publishyearsort")
+        && target.contains("order=asc")
+        && !target.contains("publishyear_prev")
+        && !target.contains("publishyear_next")
+    {
+        if target.contains("PAGEN_1=2") {
+            return (
+                200,
+                "text/html; charset=utf-8",
+                search_html(&[NO_YEAR_ID], 42),
+            );
+        }
+        return (200, "text/html; charset=utf-8", search_html(&[MOCK_ID], 42));
+    }
+    if target.contains("publishyear_prev=1911") && target.contains("publishyear_next=1911") {
+        if target.contains("PAGEN_1=2") {
+            return (200, "text/html; charset=utf-8", search_html(&[], 1));
+        }
+        return (200, "text/html; charset=utf-8", search_html(&[MOCK_ID], 1));
     }
     (200, "text/html; charset=utf-8", search_html(&[], 1))
 }
@@ -981,6 +1385,16 @@ fn search_html(ids: &[&str], total: u64) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("<html><body>Найдено {total} результатов {links}</body></html>")
+}
+
+/// Build a minimal advanced-search page containing first-party facet values.
+fn advanced_filter_html(values: &[(&str, &str)]) -> String {
+    let values = values
+        .iter()
+        .map(|(field, value)| format!(r#"<div data-id="{field}" data-value="{value}"></div>"#))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("<html><body>{values}</body></html>")
 }
 
 /// Build a rusneb-like catalog card.
@@ -1132,4 +1546,18 @@ fn search_page_status_count(db: &Path, status: &str) -> i64 {
         |row| row.get(0),
     )
     .expect("count search page status")
+}
+
+/// Count persisted search result memberships.
+fn search_item_count(db: &Path) -> i64 {
+    let conn = Connection::open(db).expect("open SQLite DB");
+    conn.query_row("SELECT COUNT(*) FROM search_items", [], |row| row.get(0))
+        .expect("count search items")
+}
+
+/// Remove search memberships to simulate databases created before this table existed.
+fn clear_search_items(db: &Path) {
+    let conn = Connection::open(db).expect("open SQLite DB");
+    conn.execute("DELETE FROM search_items", [])
+        .expect("clear search items");
 }

@@ -149,6 +149,30 @@ impl RusnebClient {
         })
     }
 
+    /// Fetch advanced-search option values for exact-field overflow sharding.
+    ///
+    /// rusneb exposes some filters, such as language and source library, as free text fields in
+    /// the advanced-search form. The values embedded in that form are safer shard candidates than
+    /// guessed query prefixes because they are first-party filter values accepted by `/search/`.
+    pub fn fetch_advanced_filter_values(
+        &mut self,
+        fields: &[String],
+    ) -> std::result::Result<BTreeMap<String, Vec<String>>, FetchFailure> {
+        let url = self
+            .base_url
+            .join("/search/extended/")
+            .map_err(to_fetch_failure)?;
+        let response = self.get_text(url.as_str()).map_err(to_fetch_failure)?;
+        if !(200..300).contains(&response.status) {
+            return Err(FetchFailure {
+                status: Some(response.status),
+                message: format!("advanced search HTTP {}", response.status),
+            });
+        }
+
+        Ok(extract_advanced_filter_values(&response.body, fields))
+    }
+
     pub fn fetch_record(&mut self, id: &str) -> std::result::Result<RusnebRecord, FetchFailure> {
         let fetched_at_unix = now_unix();
         let fetched_at = chrono::Utc::now().to_rfc3339();
@@ -348,6 +372,38 @@ fn extract_total_results(html: &str) -> Option<u64> {
         .filter(|ch| ch.is_ascii_digit())
         .collect::<String>();
     digits.parse().ok()
+}
+
+fn extract_advanced_filter_values(html: &str, fields: &[String]) -> BTreeMap<String, Vec<String>> {
+    let requested = fields.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("[data-id][data-value]").expect("valid data attribute selector");
+    let mut seen = BTreeSet::<(String, String)>::new();
+    let mut out = BTreeMap::<String, Vec<String>>::new();
+
+    for node in document.select(&selector) {
+        let Some(field) = node.value().attr("data-id") else {
+            continue;
+        };
+        if !requested.contains(field) {
+            continue;
+        }
+
+        let Some(value) = node.value().attr("data-value") else {
+            continue;
+        };
+        let value = decode_html_entities(value).trim().to_string();
+        if value.is_empty() {
+            continue;
+        }
+
+        let key = (field.to_string(), value.clone());
+        if seen.insert(key) {
+            out.entry(field.to_string()).or_default().push(value);
+        }
+    }
+
+    out
 }
 
 fn parse_card_metadata(html: &str, base_url: &Url) -> CardMetadata {
@@ -728,6 +784,33 @@ mod tests {
     fn extracts_total_results() {
         let html = "Найдено 22 514 496   результатов";
         assert_eq!(extract_total_results(html), Some(22_514_496));
+    }
+
+    #[test]
+    fn extracts_advanced_filter_values_for_requested_fields() {
+        let html = r#"
+          <div data-id="lang" data-value="Русский"></div>
+          <div data-id="lang" data-value="Русский"></div>
+          <div data-id="lang" data-value="Английский"></div>
+          <div data-id="idlibrary" data-value="Российская государственная библиотека (РГБ)"></div>
+          <div data-id="publisher" data-value="Ignored"></div>
+          <div data-id="lang" data-value=""></div>
+        "#;
+        let fields = vec!["lang".to_string(), "idlibrary".to_string()];
+
+        let values = extract_advanced_filter_values(html, &fields);
+
+        assert_eq!(
+            values.get("lang"),
+            Some(&vec!["Русский".to_string(), "Английский".to_string()])
+        );
+        assert_eq!(
+            values.get("idlibrary"),
+            Some(&vec![
+                "Российская государственная библиотека (РГБ)".to_string()
+            ])
+        );
+        assert!(!values.contains_key("publisher"));
     }
 
     #[test]

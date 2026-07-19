@@ -72,16 +72,17 @@ cargo run -- crawl --catalog 25 --access open \
 Equivalent rusneb.ru search filter:
 <https://rusneb.ru/search/?q=&c[]=25&access[]=open&publishyear_prev=1800&publishyear_next=2026>
 
-Each year gets a separate SQLite search checkpoint. Records already saved from earlier broad crawls are skipped by ID. Year-sharded crawls also seed a date-ascending no-year prefix shard by default, because rusneb.ru's date sort shows records without a publication year before dated records. Use `--skip-no-year-shard` to disable it, or `--no-year-max-pages` to change its page cap.
+Each year gets a separate SQLite search checkpoint. Records already saved from earlier broad crawls are skipped by ID. Year-sharded crawls also seed a date-ascending no-year prefix shard by default, because rusneb.ru's date sort shows records without a publication year before dated records. The no-year prefix runs after dated years and stops after five consecutive non-empty pages add no new IDs, which keeps it from repeatedly walking known dated records. Use `--skip-no-year-shard` to disable it, `--no-year-max-pages` to change its page cap, or `--no-year-stop-after-known-pages 0` to disable the duplicate-page stop.
 
-If a year shard reaches rusneb.ru's search result window, the crawler automatically seeds a sorted overflow shard with `document_titlesort:desc` and keeps going.
+If a year shard ends with rusneb.ru still reporting more rows than the crawler discovered, the crawler automatically seeds sorted overflow shards and keeps going.
 
-rusneb.ru can report more than 9,990 results for one query while returning zero records after page 666. Automatic overflow shards discover the same year through a different ordering, which exposes records hidden behind that search window. SQLite still de-duplicates item IDs, so already saved records are not fetched again. Add `--overflow-sort field:asc|desc` to choose the sort used for automatic overflow shards, or `--no-auto-overflow` to disable this behavior:
+rusneb.ru can report more than 9,990 results for one query while returning zero records after page 666; it can also report small count gaps after a normal-looking result stream. Automatic overflow shards first discover the same year through different orderings, which exposes records hidden behind those gaps. By default the crawler tries title, author, and publication-date sorts in both supported directions. If sorted shards still leave a gap, the crawler loads the first-party advanced-search facet values from [rusneb.ru/search/extended/](https://rusneb.ru/search/extended/) and seeds facet shards for `lang` and `idlibrary` by default. SQLite still de-duplicates item IDs, so already saved records are not fetched again. Add `--overflow-sort field:asc|desc` to replace the default sort list, `--overflow-facet field` to replace the default facet list, or `--no-auto-overflow` to disable automatic overflow behavior:
 
 ```sh
 cargo run -- crawl --catalog 25 --access open \
   --publishyear-prev 1 --publishyear-next 2026 --shard-years \
-  --overflow-sort document_titlesort:desc \
+  --overflow-sort document_titlesort:desc --overflow-sort document_authorsort:asc \
+  --overflow-facet lang --overflow-facet idlibrary \
   --workers 8
 ```
 
@@ -158,7 +159,9 @@ cargo run -- validate-coverage
 cargo run -- validate-coverage --catalog 25 --access open --require-year
 ```
 
-This is an offline SQLite check. It flags unfinished search shards and shards where rusneb reported more rows than the crawler discovered, including likely pagination-window cases around 9,990 results.
+This is an offline SQLite check. It reports individual shard gaps and also groups shards by the same base search with sort/order removed. The grouped check uses the durable `search_items` membership table to count the union of IDs discovered by overlapping overflow shards, so a year can validate successfully even when one sorted shard is individually window-limited. For databases created before `search_items`, validation falls back to the largest completed shard count when exact page membership is unavailable.
+
+Automatic facet overflow shards are grouped with their base query by removing `lang` and `idlibrary` from the validation grouping key. If you used custom `--overflow-facet` fields for the crawl, pass the same fields to `validate-coverage`.
 
 If a temporary rusneb.ru block leaves failed `HTTP 403` rows, wait until the site is reachable again, then reset only those rows to `pending` and rerun the same crawl command:
 

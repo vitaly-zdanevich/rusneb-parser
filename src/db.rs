@@ -8,6 +8,17 @@ pub struct SearchPage {
     pub page: u64,
 }
 
+/// Completed search page data persisted in one transaction.
+#[derive(Debug)]
+pub struct CompletedSearchPage<'a> {
+    pub search_key: &'a str,
+    pub page: u64,
+    pub ids: &'a [String],
+    pub total_results: Option<u64>,
+    pub params_json: &'a str,
+    pub next_page: Option<u64>,
+}
+
 #[derive(Debug)]
 pub struct CrawlItem {
     pub id: String,
@@ -89,6 +100,7 @@ pub struct CoverageShard {
     pub failed_pages: u64,
     pub empty_done_pages: u64,
     pub discovered_results: u64,
+    pub unique_item_ids: u64,
     pub reported_total_results: Option<u64>,
     pub max_done_page: Option<u64>,
 }
@@ -176,6 +188,16 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_items_next
                 ON items(status, updated_at);
 
+            CREATE TABLE IF NOT EXISTS search_items (
+                search_key TEXT NOT NULL,
+                page INTEGER NOT NULL,
+                id TEXT NOT NULL,
+                PRIMARY KEY (search_key, page, id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_search_items_search_key
+                ON search_items(search_key);
+
             CREATE TABLE IF NOT EXISTS records (
                 id TEXT PRIMARY KEY,
                 json TEXT NOT NULL,
@@ -200,6 +222,14 @@ impl Db {
                 fetched_at
             FROM records;
             "#,
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO search_items(search_key, page, id)
+             SELECT first_seen_search_key, first_seen_page, id
+             FROM items
+             WHERE first_seen_search_key IS NOT NULL
+               AND first_seen_page IS NOT NULL",
+            [],
         )?;
         Ok(())
     }
@@ -276,15 +306,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn complete_search_page(
-        &mut self,
-        search_key: &str,
-        page: u64,
-        result_count: usize,
-        total_results: Option<u64>,
-        params_json: &str,
-        next_page: Option<u64>,
-    ) -> Result<()> {
+    pub fn complete_search_page(&mut self, page: CompletedSearchPage<'_>) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE search_pages
@@ -295,18 +317,34 @@ impl Db {
                  updated_at = ?5
              WHERE search_key = ?1 AND page = ?2",
             params![
-                search_key,
-                page as i64,
-                result_count as i64,
-                total_results.map(|n| n as i64),
+                page.search_key,
+                page.page as i64,
+                page.ids.len() as i64,
+                page.total_results.map(|n| n as i64),
                 now_unix()
             ],
         )?;
-        if let Some(next_page) = next_page {
+        tx.execute(
+            "DELETE FROM search_items WHERE search_key = ?1 AND page = ?2",
+            params![page.search_key, page.page as i64],
+        )?;
+        for id in page.ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO search_items(search_key, page, id)
+                 VALUES (?1, ?2, ?3)",
+                params![page.search_key, page.page as i64, id],
+            )?;
+        }
+        if let Some(next_page) = page.next_page {
             tx.execute(
                 "INSERT OR IGNORE INTO search_pages(search_key, page, params_json, updated_at)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![search_key, next_page as i64, params_json, now_unix()],
+                params![
+                    page.search_key,
+                    next_page as i64,
+                    page.params_json,
+                    now_unix()
+                ],
             )?;
         }
         tx.commit()?;
@@ -698,6 +736,11 @@ impl Db {
                  SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END),
                  SUM(CASE WHEN status = 'done' AND COALESCE(result_count, 0) = 0 THEN 1 ELSE 0 END),
                  SUM(CASE WHEN status = 'done' THEN COALESCE(result_count, 0) ELSE 0 END),
+                 (
+                     SELECT COUNT(DISTINCT search_items.id)
+                     FROM search_items
+                     WHERE search_items.search_key = search_pages.search_key
+                 ),
                  MAX(total_results),
                  MAX(CASE WHEN status = 'done' THEN page ELSE NULL END)
              FROM search_pages
@@ -715,8 +758,9 @@ impl Db {
                 failed_pages: row.get::<_, i64>(6)? as u64,
                 empty_done_pages: row.get::<_, i64>(7)? as u64,
                 discovered_results: row.get::<_, i64>(8)? as u64,
-                reported_total_results: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
-                max_done_page: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
+                unique_item_ids: row.get::<_, i64>(9)? as u64,
+                reported_total_results: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
+                max_done_page: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
             })
         })?;
 
@@ -741,6 +785,11 @@ impl Db {
                      SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END),
                      SUM(CASE WHEN status = 'done' AND COALESCE(result_count, 0) = 0 THEN 1 ELSE 0 END),
                      SUM(CASE WHEN status = 'done' THEN COALESCE(result_count, 0) ELSE 0 END),
+                     (
+                         SELECT COUNT(DISTINCT search_items.id)
+                         FROM search_items
+                         WHERE search_items.search_key = search_pages.search_key
+                     ),
                      MAX(total_results),
                      MAX(CASE WHEN status = 'done' THEN page ELSE NULL END)
                  FROM search_pages
@@ -758,15 +807,36 @@ impl Db {
                         failed_pages: row.get::<_, i64>(6)? as u64,
                         empty_done_pages: row.get::<_, i64>(7)? as u64,
                         discovered_results: row.get::<_, i64>(8)? as u64,
+                        unique_item_ids: row.get::<_, i64>(9)? as u64,
                         reported_total_results: row
-                            .get::<_, Option<i64>>(9)?
+                            .get::<_, Option<i64>>(10)?
                             .map(|value| value as u64),
-                        max_done_page: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
+                        max_done_page: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
                     })
                 },
             )
             .optional()
             .context("reading search shard coverage")
+    }
+
+    /// Count unique catalog IDs discovered by any of the provided search shards.
+    pub fn count_unique_search_items_for_keys(&self, search_keys: &[String]) -> Result<u64> {
+        if search_keys.is_empty() {
+            return Ok(0);
+        }
+
+        let placeholders = std::iter::repeat_n("?", search_keys.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT COUNT(DISTINCT id)
+             FROM search_items
+             WHERE search_key IN ({placeholders})"
+        );
+        let params = rusqlite::params_from_iter(search_keys.iter());
+        Ok(self
+            .conn
+            .query_row(&sql, params, |row| row.get::<_, i64>(0))? as u64)
     }
 
     fn work_status_summary(&self, table: &str) -> Result<WorkStatusSummary> {
