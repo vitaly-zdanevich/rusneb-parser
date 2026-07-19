@@ -26,9 +26,9 @@ Options:
   --workers N     Maximum item workers [default: 8]
   --log-dir PATH  Directory for per-run logs [default: run-logs]
   --init-db       Allow creating a missing SQLite database
-  --no-validate   Do not run final stats and coverage validation after the crawl exits
+  --no-validate   Do not run the final completion report after the crawl exits
   --validate-top N
-                  Maximum suspicious coverage shards/groups to print [default: 50]
+                  Maximum suspicious report coverage shards/groups to print [default: 50]
   --force         Ignore an existing crawler lock for the same SQLite database
   -h, --help      Show this help
 
@@ -172,7 +172,8 @@ parser=()
 parser_supports_required_options() {
   local help
   help="$("$@" crawl --help)"
-  [[ "$help" == *"--ssh"* && "$help" == *"--skip-no-year-shard"* && "$help" == *"--no-year-stop-after-known-pages"* ]]
+  [[ "$help" == *"--ssh"* && "$help" == *"--skip-no-year-shard"* && "$help" == *"--no-year-stop-after-known-pages"* ]] &&
+    "$@" report --help >/dev/null
 }
 
 if [[ -x ./target-codex/release/rusneb-parser ]] &&
@@ -275,22 +276,14 @@ echo "Crawler exited at $(date -u +%Y-%m-%dT%H:%M:%SZ) with status $crawl_status
 final_status=$crawl_status
 if [[ "$validate_coverage" == 1 ]]; then
   echo
-  echo "Final crawler stats:"
-  "${parser[@]}" stats --db "$db_abs"
-  stats_status=$?
-  if [[ "$stats_status" -ne 0 && "$final_status" -eq 0 ]]; then
-    final_status=$stats_status
-  fi
-
-  echo
-  echo "Final coverage validation:"
-  "${parser[@]}" validate-coverage --db "$db_abs" --catalog 25 --access open --require-year --top "$validate_top"
-  validation_status=$?
-  if [[ "$validation_status" -ne 0 && "$final_status" -eq 0 ]]; then
-    final_status=$validation_status
+  echo "Final completion report:"
+  "${parser[@]}" report --db "$db_abs" --catalog 25 --access open --require-year --top "$validate_top"
+  report_status=$?
+  if [[ "$report_status" -ne 0 && "$final_status" -eq 0 ]]; then
+    final_status=$report_status
   fi
 else
-  echo "Final coverage validation disabled."
+  echo "Final completion report disabled."
 fi
 
 echo "Run finished at $(date -u +%Y-%m-%dT%H:%M:%SZ) with status $final_status"
@@ -308,9 +301,9 @@ echo "Lock: $lock_dir"
 echo "Log: $log_file"
 echo "Latest log symlink: $latest_log"
 if [[ "$validate_coverage" == 1 ]]; then
-  echo "Final validation: enabled (--top $validate_top)"
+  echo "Final completion report: enabled (--top $validate_top)"
 else
-  echo "Final validation: disabled"
+  echo "Final completion report: disabled"
 fi
 if [[ -n "$ssh_target" ]]; then
   echo "SSH: $ssh_target"

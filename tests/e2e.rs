@@ -212,6 +212,20 @@ fn crawl_persists_record_resumes_and_exports_jsonl() {
     assert!(validation_stdout.contains("coverage ok"));
     assert_eq!(search_item_count(&db), 1);
 
+    let report = run_ok(
+        Command::new(parser_bin())
+            .arg("report")
+            .arg("--db")
+            .arg(&db)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open"),
+    );
+    let report_stdout = String::from_utf8(report.stdout).expect("report stdout is UTF-8");
+    assert!(report_stdout.contains("completion ok"));
+    assert!(report_stdout.contains("records: 1"));
+
     run_ok(
         Command::new(parser_bin())
             .arg("export-manifest")
@@ -418,6 +432,27 @@ fn crawl_exhausts_card_403_and_retry_failed_resets_it() {
     assert_eq!(item_status(&db, FORBIDDEN_ID), "failed");
     assert_eq!(item_attempts(&db, FORBIDDEN_ID), 2);
     assert_eq!(item_last_http_status(&db, FORBIDDEN_ID), Some(403));
+
+    let report = run_command(
+        Command::new(parser_bin())
+            .arg("report")
+            .arg("--db")
+            .arg(&db)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--max-attempts")
+            .arg("2")
+            .arg("--failed-item-sample")
+            .arg("1"),
+    );
+    assert!(!report.status.success());
+    let report_stdout = String::from_utf8(report.stdout).expect("report stdout is UTF-8");
+    assert!(report_stdout.contains("failed item HTTP statuses"));
+    assert!(report_stdout.contains("HTTP 403: 1"));
+    assert!(report_stdout.contains(FORBIDDEN_ID));
+    assert!(report_stdout.contains("retry-failed"));
 
     run_ok(
         Command::new(parser_bin())

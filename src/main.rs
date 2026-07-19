@@ -47,6 +47,8 @@ enum Command {
     Stats(StatsArgs),
     /// Validate whether completed search pages cover rusneb-reported result totals.
     ValidateCoverage(ValidateCoverageArgs),
+    /// Print one completion report with crawl state, coverage, and retry hints.
+    Report(ReportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -349,6 +351,20 @@ struct ValidateCoverageArgs {
     overflow_facets: Vec<String>,
 }
 
+#[derive(Debug, Args)]
+struct ReportArgs {
+    #[command(flatten)]
+    coverage: ValidateCoverageArgs,
+
+    /// Maximum attempts used to classify retryable and exhausted failures.
+    #[arg(long, default_value_t = 5)]
+    max_attempts: u32,
+
+    /// Maximum failed item IDs to print as diagnostics.
+    #[arg(long, default_value_t = 20)]
+    failed_item_sample: u64,
+}
+
 #[derive(Debug, Clone)]
 struct SearchJob {
     label: String,
@@ -374,6 +390,29 @@ struct CoverageGroup {
     unfinished_shards: usize,
     unique_item_ids: u64,
     reported_total_results: Option<u64>,
+}
+
+#[derive(Debug)]
+struct CoverageValidationSummary {
+    shards: usize,
+    groups: usize,
+    unfinished_shards: usize,
+    gap_shards: usize,
+    window_limited_shards: usize,
+    per_query_missing_results: u64,
+    unfinished_groups: usize,
+    gap_groups: usize,
+    grouped_missing_results: u64,
+    display_shards_total: usize,
+    display_groups_total: usize,
+    display_shard_lines: Vec<String>,
+    display_group_lines: Vec<String>,
+}
+
+impl CoverageValidationSummary {
+    fn is_ok(&self) -> bool {
+        self.unfinished_groups == 0 && self.gap_groups == 0
+    }
 }
 
 impl CoverageGroup {
@@ -636,6 +675,7 @@ fn main() -> Result<()> {
         }
         Command::Stats(args) => print_stats(args),
         Command::ValidateCoverage(args) => validate_coverage(args),
+        Command::Report(args) => report(args),
     }
 }
 
@@ -1857,18 +1897,143 @@ fn print_stats(args: StatsArgs) -> Result<()> {
 
 fn validate_coverage(args: ValidateCoverageArgs) -> Result<()> {
     let db = Db::open(&args.common.db)?;
-    let overflow_facets = effective_coverage_overflow_facets(&args);
+    let summary = coverage_validation_summary(&db, &args)?;
+    print_coverage_validation_summary(&summary, args.top);
+
+    if summary.is_ok() {
+        println!("coverage ok: completed search groups cover all reported totals");
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "coverage validation failed: {} unfinished group(s), {} group(s) with coverage gaps",
+        summary.unfinished_groups,
+        summary.gap_groups
+    )
+}
+
+fn report(args: ReportArgs) -> Result<()> {
+    let db = Db::open(&args.coverage.common.db)?;
+    let state = db.crawl_completion_summary(args.max_attempts)?;
+    let coverage = coverage_validation_summary(&db, &args.coverage)?;
+    let failed_statuses = db.failed_item_http_status_counts()?;
+    let failed_sample = db.failed_item_sample(args.failed_item_sample)?;
+
+    println!("completion report:");
+    println!("  db: {}", args.coverage.common.db.display());
+    println!("  records: {}", state.records);
+    print_work_status_summary("items", &state.items);
+    println!("    retryable_failed: {}", state.retryable_failed_items);
+    println!("    exhausted_failed: {}", state.exhausted_failed_items);
+    print_work_status_summary("search_pages", &state.search_pages);
+    println!(
+        "    retryable_failed: {}",
+        state.retryable_failed_search_pages
+    );
+    println!(
+        "    exhausted_failed: {}",
+        state.exhausted_failed_search_pages
+    );
+
+    println!("coverage:");
+    print_coverage_validation_summary(&coverage, args.coverage.top);
+
+    if !failed_statuses.is_empty() {
+        println!("failed item HTTP statuses:");
+        for count in failed_statuses {
+            let status = count
+                .http_status
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "<none>".to_string());
+            println!("  HTTP {status}: {}", count.count);
+        }
+    }
+
+    if !failed_sample.is_empty() {
+        println!("failed item sample:");
+        for item in failed_sample {
+            let status = item
+                .last_http_status
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "<none>".to_string());
+            let error = item.last_error.unwrap_or_else(|| "<no error>".to_string());
+            println!(
+                "  {} | attempts={} HTTP={} updated_at={} | {}",
+                item.id, item.attempts, status, item.updated_at_unix, error
+            );
+        }
+    }
+
+    let unfinished = unfinished_work(&state);
+    let exhausted = state.exhausted_failed_items + state.exhausted_failed_search_pages;
+    let complete = unfinished == 0 && exhausted == 0 && coverage.is_ok();
+    if complete {
+        println!("completion ok: no pending, retryable, exhausted, or coverage-gap work found");
+        return Ok(());
+    }
+
+    println!("next steps:");
+    if state.failed_403_items > 0 || state.failed_403_search_pages > 0 {
+        println!(
+            "  retry HTTP 403 rows: rusneb-parser retry-failed --db {} --http-status 403",
+            args.coverage.common.db.display()
+        );
+    }
+    if exhausted > 0 {
+        println!(
+            "  retry exhausted failures: rusneb-parser retry-failed --db {}",
+            args.coverage.common.db.display()
+        );
+    }
+    if unfinished > 0 {
+        println!("  rerun the crawl command to drain pending or retryable work");
+    }
+    if !coverage.is_ok() {
+        println!(
+            "  rerun the crawl command so automatic overflow sharding can close coverage gaps"
+        );
+    }
+
+    anyhow::bail!("completion report found incomplete crawl state")
+}
+
+fn print_work_status_summary(label: &str, summary: &db::WorkStatusSummary) {
+    println!("{label}:");
+    println!("    done: {}", summary.done);
+    println!("    missing: {}", summary.missing);
+    println!("    pending: {}", summary.pending);
+    println!("    in_progress: {}", summary.in_progress);
+    println!("    failed: {}", summary.failed);
+    if summary.other > 0 {
+        println!("    other: {}", summary.other);
+    }
+}
+
+fn unfinished_work(summary: &db::CrawlCompletionSummary) -> u64 {
+    summary.items.pending
+        + summary.items.in_progress
+        + summary.retryable_failed_items
+        + summary.search_pages.pending
+        + summary.search_pages.in_progress
+        + summary.retryable_failed_search_pages
+}
+
+fn coverage_validation_summary(
+    db: &Db,
+    args: &ValidateCoverageArgs,
+) -> Result<CoverageValidationSummary> {
+    let overflow_facets = effective_coverage_overflow_facets(args);
     let report = db.coverage_report()?;
     let shards = report
         .shards
         .iter()
-        .filter(|shard| coverage_shard_matches_filters(shard, &args))
+        .filter(|shard| coverage_shard_matches_filters(shard, args))
         .collect::<Vec<_>>();
     if shards.is_empty() {
         anyhow::bail!("coverage validation failed: no search pages found");
     }
 
-    let groups = build_coverage_groups(&db, &shards, &overflow_facets)?;
+    let groups = build_coverage_groups(db, &shards, &overflow_facets)?;
     let unfinished_shards = shards
         .iter()
         .filter(|shard| shard.has_unfinished_pages())
@@ -1898,16 +2063,8 @@ fn validate_coverage(args: ValidateCoverageArgs) -> Result<()> {
         .filter_map(CoverageGroup::missing_results)
         .sum::<u64>();
 
-    println!("search coverage:");
-    println!("  shards: {}", shards.len());
-    println!("  groups: {}", groups.len());
-    println!("  unfinished_shards: {unfinished_shards}");
-    println!("  gap_shards: {gap_shards}");
-    println!("  window_limited_shards: {window_limited_shards}");
-    println!("  per_query_missing_results: {per_query_missing_results}");
-    println!("  unfinished_groups: {unfinished_groups}");
-    println!("  gap_groups: {gap_groups}");
-    println!("  grouped_missing_results: {grouped_missing_results}");
+    let shard_count = shards.len();
+    let group_count = groups.len();
 
     let mut display_shards = shards
         .into_iter()
@@ -1919,19 +2076,12 @@ fn validate_coverage(args: ValidateCoverageArgs) -> Result<()> {
             shard.discovered_results,
         ))
     });
-
-    if !display_shards.is_empty() {
-        println!("shards:");
-        for shard in display_shards.iter().take(args.top) {
-            print_coverage_shard(shard, args.window_limit_results);
-        }
-        if display_shards.len() > args.top {
-            println!(
-                "  ... {} more shard(s), raise --top to print them",
-                display_shards.len() - args.top
-            );
-        }
-    }
+    let display_shards_total = display_shards.len();
+    let display_shard_lines = display_shards
+        .iter()
+        .take(args.top)
+        .map(|shard| coverage_shard_line(shard, args.window_limit_results))
+        .collect::<Vec<_>>();
 
     let mut display_groups = groups
         .iter()
@@ -1940,28 +2090,73 @@ fn validate_coverage(args: ValidateCoverageArgs) -> Result<()> {
     display_groups.sort_by_key(|group| {
         std::cmp::Reverse((group.missing_results().unwrap_or(0), group.unique_item_ids))
     });
+    let display_groups_total = display_groups.len();
+    let display_group_lines = display_groups
+        .iter()
+        .take(args.top)
+        .map(|group| coverage_group_line(group))
+        .collect::<Vec<_>>();
 
-    if !display_groups.is_empty() {
-        println!("groups:");
-        for group in display_groups.iter().take(args.top) {
-            print_coverage_group(group);
+    Ok(CoverageValidationSummary {
+        shards: shard_count,
+        groups: group_count,
+        unfinished_shards,
+        gap_shards,
+        window_limited_shards,
+        per_query_missing_results,
+        unfinished_groups,
+        gap_groups,
+        grouped_missing_results,
+        display_shards_total,
+        display_groups_total,
+        display_shard_lines,
+        display_group_lines,
+    })
+}
+
+fn print_coverage_validation_summary(summary: &CoverageValidationSummary, top: usize) {
+    println!("search coverage:");
+    println!("  shards: {}", summary.shards);
+    println!("  groups: {}", summary.groups);
+    println!("  unfinished_shards: {}", summary.unfinished_shards);
+    println!("  gap_shards: {}", summary.gap_shards);
+    println!("  window_limited_shards: {}", summary.window_limited_shards);
+    println!(
+        "  per_query_missing_results: {}",
+        summary.per_query_missing_results
+    );
+    println!("  unfinished_groups: {}", summary.unfinished_groups);
+    println!("  gap_groups: {}", summary.gap_groups);
+    println!(
+        "  grouped_missing_results: {}",
+        summary.grouped_missing_results
+    );
+
+    if !summary.display_shard_lines.is_empty() {
+        println!("shards:");
+        for line in &summary.display_shard_lines {
+            println!("{line}");
         }
-        if display_groups.len() > args.top {
+        if summary.display_shards_total > top {
             println!(
-                "  ... {} more group(s), raise --top to print them",
-                display_groups.len() - args.top
+                "  ... {} more shard(s), raise --top to print them",
+                summary.display_shards_total - top
             );
         }
     }
 
-    if unfinished_groups == 0 && gap_groups == 0 {
-        println!("coverage ok: completed search groups cover all reported totals");
-        return Ok(());
+    if !summary.display_group_lines.is_empty() {
+        println!("groups:");
+        for line in &summary.display_group_lines {
+            println!("{line}");
+        }
+        if summary.display_groups_total > top {
+            println!(
+                "  ... {} more group(s), raise --top to print them",
+                summary.display_groups_total - top
+            );
+        }
     }
-
-    anyhow::bail!(
-        "coverage validation failed: {unfinished_groups} unfinished group(s), {gap_groups} group(s) with coverage gaps"
-    )
 }
 
 fn build_coverage_groups(
@@ -2048,10 +2243,10 @@ fn coverage_shard_matches_filters(shard: &db::CoverageShard, args: &ValidateCove
     true
 }
 
-fn print_coverage_shard(shard: &db::CoverageShard, window_limit_results: u64) {
+fn coverage_shard_line(shard: &db::CoverageShard, window_limit_results: u64) -> String {
     let missing = shard.missing_results().unwrap_or(0);
     let flags = coverage_flags(shard, window_limit_results);
-    println!(
+    format!(
         "  {} | {} | pages={} done={} pending={} in_progress={} failed={} discovered={} unique={} total={:?} missing={} max_done_page={:?}{}",
         shard.search_key,
         coverage_shard_label(&shard.params_json),
@@ -2066,12 +2261,12 @@ fn print_coverage_shard(shard: &db::CoverageShard, window_limit_results: u64) {
         missing,
         shard.max_done_page,
         flags
-    );
+    )
 }
 
-fn print_coverage_group(group: &CoverageGroup) {
+fn coverage_group_line(group: &CoverageGroup) -> String {
     let missing = group.missing_results().unwrap_or(0);
-    println!(
+    format!(
         "  {} | {} | shards={} unfinished={} unique={} total={:?} missing={} keys={}",
         group.key,
         group.label,
@@ -2081,7 +2276,7 @@ fn print_coverage_group(group: &CoverageGroup) {
         group.reported_total_results,
         missing,
         group.search_keys.join(",")
-    );
+    )
 }
 
 fn coverage_flags(shard: &db::CoverageShard, window_limit_results: u64) -> String {

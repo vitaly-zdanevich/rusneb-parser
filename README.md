@@ -104,7 +104,7 @@ Resume the long books crawl with the checked-in operational wrapper:
 ./continue.sh --workers 8 --ssh ubuntu@151.145.94.114
 ```
 
-`continue.sh` uses strict Bash mode, refuses to create a missing SQLite database unless `--init-db` is passed, writes a timestamped log under `run-logs/`, and creates a database-specific lock directory next to the SQLite file. It starts a background runner, records the runner PID in `run-logs/crawl.pid`, and records the actual crawler child PID inside the lock directory. After the crawler exits, the runner appends final `stats` and `validate-coverage --catalog 25 --access open --require-year` output to the same log. Use `--no-validate` to disable that final check, or `--validate-top` to control how many suspicious coverage rows are printed. If a stale lock remains after a crash, the next run removes it; use `--force` only when you have checked that no crawler is still using the same database.
+`continue.sh` uses strict Bash mode, refuses to create a missing SQLite database unless `--init-db` is passed, writes a timestamped log under `run-logs/`, and creates a database-specific lock directory next to the SQLite file. It starts a background runner, records the runner PID in `run-logs/crawl.pid`, and records the actual crawler child PID inside the lock directory. After the crawler exits, the runner appends a final `report --catalog 25 --access open --require-year` completion report to the same log. Use `--no-validate` to disable that final report, or `--validate-top` to control how many suspicious coverage rows are printed. If a stale lock remains after a crash, the next run removes it; use `--force` only when you have checked that no crawler is still using the same database.
 
 For unreliable network/server periods, tune the automatic transient-error pause threshold:
 
@@ -153,6 +153,12 @@ Print checkpoint state:
 
 ```sh
 cargo run -- stats
+```
+
+Print a completion report with crawl state, coverage gaps, failed HTTP status counts, failed item samples, and retry hints:
+
+```sh
+cargo run -- report --catalog 25 --access open --require-year
 ```
 
 Validate that completed search pages cover the result totals reported by rusneb.ru:
