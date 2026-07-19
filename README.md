@@ -111,6 +111,14 @@ For unreliable network/server periods, tune the automatic transient-error pause 
 cargo run -- crawl --workers 10 --max-consecutive-transport-errors 30 --transient-error-pause-secs 120
 ```
 
+Repeated `HTTP 403` responses are treated separately from server `5xx` errors. After several consecutive card/search `403` responses, the crawler assumes rusneb.ru may be temporarily blocking the client, puts the triggering row back to `pending` without spending an attempt, and pauses all workers:
+
+```sh
+cargo run -- crawl --max-consecutive-403-errors 8 --http-403-pause-secs 600
+```
+
+Use `--max-consecutive-403-errors 0` only when you want every `403` to count as a normal failed row.
+
 Use a fixed worker count without adaptive limiting:
 
 ```sh

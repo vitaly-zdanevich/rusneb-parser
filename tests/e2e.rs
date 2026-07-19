@@ -31,6 +31,8 @@ enum MockMode {
     TransientCard500,
     /// Serve one search result whose card page always returns HTTP 403.
     ForbiddenCard403,
+    /// Serve HTTP 403 for the first search request, then a normal search page.
+    Search403ThenOk,
     /// Serve two search result shards: the default year shard and one sorted overflow shard.
     OverflowSearch,
     /// Serve a no-publication-year prefix shard plus an empty year shard.
@@ -385,6 +387,8 @@ fn crawl_exhausts_card_403_and_retry_failed_resets_it() {
             .arg("1")
             .arg("--max-attempts")
             .arg("2")
+            .arg("--max-consecutive-403-errors")
+            .arg("0")
             .arg("--timeout-secs")
             .arg("5"),
     );
@@ -416,6 +420,101 @@ fn crawl_exhausts_card_403_and_retry_failed_resets_it() {
     assert_eq!(item_status(&db, FORBIDDEN_ID), "pending");
     assert_eq!(item_attempts(&db, FORBIDDEN_ID), 0);
     assert_eq!(item_last_http_status(&db, FORBIDDEN_ID), None);
+}
+
+#[test]
+fn crawl_defers_card_403_after_global_block_threshold() {
+    let workspace = TempWorkspace::new("forbidden-block");
+    let server = MockRusnebServer::start(MockMode::ForbiddenCard403);
+    let db = workspace.join("state.sqlite");
+
+    let crawl = run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--max-pages")
+            .arg("1")
+            .arg("--max-items")
+            .arg("2")
+            .arg("--workers")
+            .arg("1")
+            .arg("--max-attempts")
+            .arg("5")
+            .arg("--max-consecutive-403-errors")
+            .arg("2")
+            .arg("--http-403-pause-secs")
+            .arg("0")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+    let stderr = String::from_utf8(crawl.stderr).expect("crawl stderr is UTF-8");
+    assert!(stderr.contains("HTTP 403 block threshold reached"));
+
+    let requests = server.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request == &&format!("/catalog/{FORBIDDEN_ID}/"))
+            .count(),
+        2
+    );
+    assert_eq!(item_status(&db, FORBIDDEN_ID), "pending");
+    assert_eq!(item_attempts(&db, FORBIDDEN_ID), 1);
+    assert_eq!(item_last_http_status(&db, FORBIDDEN_ID), Some(403));
+}
+
+#[test]
+fn crawl_defers_search_403_after_global_block_threshold() {
+    let workspace = TempWorkspace::new("search-403-block");
+    let server = MockRusnebServer::start(MockMode::Search403ThenOk);
+    let db = workspace.join("state.sqlite");
+
+    let crawl = run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--max-pages")
+            .arg("1")
+            .arg("--max-items")
+            .arg("0")
+            .arg("--workers")
+            .arg("1")
+            .arg("--max-attempts")
+            .arg("5")
+            .arg("--max-consecutive-403-errors")
+            .arg("1")
+            .arg("--http-403-pause-secs")
+            .arg("0")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+    let stderr = String::from_utf8(crawl.stderr).expect("crawl stderr is UTF-8");
+    assert!(stderr.contains("HTTP 403 block threshold reached"));
+
+    assert_eq!(search_page_status(&db, 1), "done");
+    assert_eq!(search_page_status_count(&db, "failed"), 0);
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.starts_with("/search/"))
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -716,22 +815,28 @@ fn handle_connection(mut stream: TcpStream, mode: MockMode, requests: Arc<Mutex<
         .nth(1)
         .unwrap_or("/")
         .to_string();
-    requests
-        .lock()
-        .expect("lock request log")
-        .push(target.clone());
+    let request_number = {
+        let mut requests = requests.lock().expect("lock request log");
+        requests.push(target.clone());
+        requests.len()
+    };
 
-    let (status, content_type, body) = route_response(mode, &target);
+    let (status, content_type, body) = route_response(mode, &target, request_number);
     write_response(&mut stream, status, content_type, &body);
 }
 
 /// Return the mock response for a request target.
-fn route_response(mode: MockMode, target: &str) -> (u16, &'static str, String) {
+fn route_response(
+    mode: MockMode,
+    target: &str,
+    request_number: usize,
+) -> (u16, &'static str, String) {
     match mode {
         MockMode::CompleteRecord => route_complete_record(target),
         MockMode::MissingRecord => route_missing_record(target),
         MockMode::TransientCard500 => route_transient_card_500(target),
         MockMode::ForbiddenCard403 => route_forbidden_card_403(target),
+        MockMode::Search403ThenOk => route_search_403_then_ok(target, request_number),
         MockMode::OverflowSearch => route_overflow_search(target),
         MockMode::NoYearSearch => route_no_year_search(target),
     }
@@ -799,6 +904,17 @@ fn route_forbidden_card_403(target: &str) -> (u16, &'static str, String) {
     }
     if target == format!("/catalog/{FORBIDDEN_ID}/") {
         return (403, "text/plain; charset=utf-8", "forbidden".to_string());
+    }
+    (404, "text/plain; charset=utf-8", "not found".to_string())
+}
+
+/// Return one search HTTP 403 response, then a normal search response.
+fn route_search_403_then_ok(target: &str, request_number: usize) -> (u16, &'static str, String) {
+    if target.starts_with("/search/") && request_number == 1 {
+        return (403, "text/plain; charset=utf-8", "forbidden".to_string());
+    }
+    if target.starts_with("/search/") {
+        return (200, "text/html; charset=utf-8", search_html(&[MOCK_ID], 1));
     }
     (404, "text/plain; charset=utf-8", "not found".to_string())
 }

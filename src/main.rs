@@ -189,6 +189,14 @@ struct CrawlArgs {
     #[arg(long, default_value_t = 60)]
     transient_error_pause_secs: u64,
 
+    /// Consecutive HTTP 403 card/search errors before treating rusneb as temporarily blocking this client. Default is max(4, workers). Use 0 to disable.
+    #[arg(long)]
+    max_consecutive_403_errors: Option<u64>,
+
+    /// Pause duration after too many consecutive HTTP 403 errors.
+    #[arg(long, default_value_t = 600)]
+    http_403_pause_secs: u64,
+
     /// User-Agent sent to rusneb.ru.
     #[arg(long, default_value = "rusneb-parser/0.1 metadata crawler")]
     user_agent: String,
@@ -821,6 +829,7 @@ fn crawl(args: CrawlArgs) -> Result<()> {
     let discovery_done = Arc::new(AtomicBool::new(args.no_discover));
     let started_items = Arc::new(AtomicU64::new(0));
     let consecutive_transient_errors = Arc::new(AtomicU64::new(0));
+    let consecutive_403_errors = Arc::new(AtomicU64::new(0));
     let transient_pause_until = Arc::new(AtomicI64::new(0));
     let workers = args.workers.get();
     let min_workers = args.min_workers.get().min(workers);
@@ -837,6 +846,11 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         .or_else(|| Some((workers as u64).saturating_mul(4).max(20)))
         .filter(|limit| *limit > 0);
     let transient_error_pause = Duration::from_secs(args.transient_error_pause_secs);
+    let http_403_pause_threshold = args
+        .max_consecutive_403_errors
+        .or_else(|| Some((workers as u64).max(4)))
+        .filter(|limit| *limit > 0);
+    let http_403_pause = Duration::from_secs(args.http_403_pause_secs);
     let ssh_tunnel = args.ssh.as_deref().map(SshTunnel::start).transpose()?;
     let proxy_url = ssh_tunnel.as_ref().map(|tunnel| tunnel.proxy_url.clone());
 
@@ -861,6 +875,7 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         let discovery_done = Arc::clone(&discovery_done);
         let started_items = Arc::clone(&started_items);
         let consecutive_transient_errors = Arc::clone(&consecutive_transient_errors);
+        let consecutive_403_errors = Arc::clone(&consecutive_403_errors);
         let transient_pause_until = Arc::clone(&transient_pause_until);
         let worker_control = Arc::clone(&worker_control);
         let delay = Duration::from_millis(args.delay_ms);
@@ -883,10 +898,13 @@ fn crawl(args: CrawlArgs) -> Result<()> {
                 proxy_url,
                 transient_error_pause_threshold,
                 transient_error_pause,
+                http_403_pause_threshold,
+                http_403_pause,
                 shutdown,
                 discovery_done,
                 started_items,
                 consecutive_transient_errors,
+                consecutive_403_errors,
                 transient_pause_until,
                 worker_control,
             );
@@ -932,10 +950,13 @@ fn crawl(args: CrawlArgs) -> Result<()> {
                         job.max_pages,
                         &shutdown,
                         &consecutive_transient_errors,
+                        &consecutive_403_errors,
                         &transient_pause_until,
                         &worker_control,
                         transient_error_pause_threshold,
                         transient_error_pause,
+                        http_403_pause_threshold,
+                        http_403_pause,
                     );
                     if result.is_err() {
                         break;
@@ -1034,10 +1055,13 @@ fn run_search_discovery(
     job_max_pages: Option<u64>,
     shutdown: &AtomicBool,
     consecutive_transient_errors: &AtomicU64,
+    consecutive_403_errors: &AtomicU64,
     transient_pause_until: &AtomicI64,
     worker_control: &WorkerControl,
     transient_error_pause_threshold: Option<u64>,
     transient_error_pause: Duration,
+    http_403_pause_threshold: Option<u64>,
+    http_403_pause: Duration,
 ) -> Result<()> {
     let max_pages = min_optional_u64(args.max_pages, job_max_pages);
     let last_search_page = max_pages.map(|n| args.start_page.saturating_add(n).saturating_sub(1));
@@ -1068,6 +1092,7 @@ fn run_search_discovery(
         match client.fetch_search_page(search_params, page.page) {
             Ok(result) => {
                 consecutive_transient_errors.store(0, Ordering::SeqCst);
+                consecutive_403_errors.store(0, Ordering::SeqCst);
                 let inserted =
                     db.enqueue_items(Some(&page.search_key), Some(page.page), &result.ids)?;
                 let next_page = if result.ids.is_empty() {
@@ -1098,6 +1123,7 @@ fn run_search_discovery(
             }
             Err(error) => {
                 if is_transient_failure(error.status) {
+                    consecutive_403_errors.store(0, Ordering::SeqCst);
                     db.defer_search_page_after_transient_error(
                         &page.search_key,
                         page.page,
@@ -1118,7 +1144,28 @@ fn run_search_discovery(
                         consecutive_transient_errors,
                         transient_pause_until,
                     );
+                } else if is_http_403_failure(error.status)
+                    && should_defer_after_http_403_burst(
+                        "search discovery",
+                        consecutive_403_errors,
+                        http_403_pause_threshold,
+                        http_403_pause,
+                        transient_pause_until,
+                    )
+                {
+                    db.defer_search_page_after_transient_error(
+                        &page.search_key,
+                        page.page,
+                        &error.message,
+                    )?;
+                    eprintln!(
+                        "deferred search page {} after likely HTTP 403 block: {}",
+                        page.page, error.message
+                    );
                 } else {
+                    if !is_http_403_failure(error.status) {
+                        consecutive_403_errors.store(0, Ordering::SeqCst);
+                    }
                     db.fail_search_page(&page.search_key, page.page, &error.message)?;
                     eprintln!("failed search page {}: {}", page.page, error.message);
                 }
@@ -1150,10 +1197,13 @@ fn item_worker(
     proxy_url: Option<String>,
     transient_error_pause_threshold: Option<u64>,
     transient_error_pause: Duration,
+    http_403_pause_threshold: Option<u64>,
+    http_403_pause: Duration,
     shutdown: Arc<AtomicBool>,
     discovery_done: Arc<AtomicBool>,
     started_items: Arc<AtomicU64>,
     consecutive_transient_errors: Arc<AtomicU64>,
+    consecutive_403_errors: Arc<AtomicU64>,
     transient_pause_until: Arc<AtomicI64>,
     worker_control: Arc<WorkerControl>,
 ) -> Result<WorkerStats> {
@@ -1203,6 +1253,7 @@ fn item_worker(
         match client.fetch_record(&item.id) {
             Ok(record) => {
                 consecutive_transient_errors.store(0, Ordering::SeqCst);
+                consecutive_403_errors.store(0, Ordering::SeqCst);
                 let title = log_record_title(&record);
                 let fetched_at = record.fetched_at_unix;
                 let json = serde_json::to_string(&record)?;
@@ -1213,6 +1264,7 @@ fn item_worker(
             }
             Err(error) => {
                 if is_transient_failure(error.status) {
+                    consecutive_403_errors.store(0, Ordering::SeqCst);
                     db.defer_item_after_transient_error(&item.id, &error.message, error.status)?;
                     stats.deferred += 1;
                     let consecutive =
@@ -1231,11 +1283,30 @@ fn item_worker(
                         &consecutive_transient_errors,
                         &transient_pause_until,
                     );
+                } else if is_http_403_failure(error.status)
+                    && should_defer_after_http_403_burst(
+                        &format!("worker {worker_id}"),
+                        &consecutive_403_errors,
+                        http_403_pause_threshold,
+                        http_403_pause,
+                        &transient_pause_until,
+                    )
+                {
+                    db.defer_item_after_transient_error(&item.id, &error.message, error.status)?;
+                    stats.deferred += 1;
+                    eprintln!(
+                        "worker {worker_id}: deferred {} after likely HTTP 403 block: {}",
+                        item.id, error.message
+                    );
                 } else if is_missing_item_failure(error.status) {
+                    consecutive_403_errors.store(0, Ordering::SeqCst);
                     db.mark_item_missing(&item.id, &error.message, error.status)?;
                     stats.missing += 1;
                     eprintln!("worker {worker_id}: missing {}: {}", item.id, error.message);
                 } else {
+                    if !is_http_403_failure(error.status) {
+                        consecutive_403_errors.store(0, Ordering::SeqCst);
+                    }
                     db.fail_item(&item.id, &error.message, error.status)?;
                     stats.failed += 1;
                     worker_control.on_item_failure();
@@ -1285,11 +1356,58 @@ fn is_missing_item_failure(status: Option<u16>) -> bool {
     status == Some(404)
 }
 
+fn is_http_403_failure(status: Option<u16>) -> bool {
+    status == Some(403)
+}
+
 fn is_transient_failure(status: Option<u16>) -> bool {
     match status {
         None => true,
         Some(status) => (500..600).contains(&status),
     }
+}
+
+fn should_defer_after_http_403_burst(
+    source: &str,
+    consecutive_403_errors: &AtomicU64,
+    threshold: Option<u64>,
+    pause: Duration,
+    pause_until: &AtomicI64,
+) -> bool {
+    let Some(threshold) = threshold else {
+        return false;
+    };
+    let consecutive = consecutive_403_errors.fetch_add(1, Ordering::SeqCst) + 1;
+    if consecutive < threshold {
+        return false;
+    }
+
+    let pause_secs = pause.as_secs();
+    if pause_secs == 0 {
+        consecutive_403_errors.store(0, Ordering::SeqCst);
+        eprintln!(
+            "{source}: HTTP 403 block threshold reached after {consecutive} consecutive HTTP 403 errors; retrying affected rows without spending attempts"
+        );
+        return true;
+    }
+
+    let until = db::now_unix().saturating_add(pause_secs as i64);
+    let mut current = pause_until.load(Ordering::SeqCst);
+    while current < until {
+        match pause_until.compare_exchange(current, until, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => {
+                consecutive_403_errors.store(0, Ordering::SeqCst);
+                eprintln!(
+                    "{source}: pausing for {pause_secs}s after {consecutive} consecutive HTTP 403 errors; retrying affected rows without spending attempts"
+                );
+                return true;
+            }
+            Err(actual) => current = actual,
+        }
+    }
+
+    consecutive_403_errors.store(0, Ordering::SeqCst);
+    true
 }
 
 fn wait_for_transient_pause(shutdown: &AtomicBool, pause_until: &AtomicI64) -> bool {
