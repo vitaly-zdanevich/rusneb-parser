@@ -22,6 +22,9 @@ const OVERFLOW_SORTED_ID: &str = "overflow-sorted";
 const OVERFLOW_LANG_A_ID: &str = "overflow-lang-a";
 const OVERFLOW_LANG_B_ID: &str = "overflow-lang-b";
 const OVERFLOW_LANG_C_ID: &str = "overflow-lang-c";
+const RESUME_ID_A: &str = "resume-record-a";
+const RESUME_ID_B: &str = "resume-record-b";
+const RESUME_ID_C: &str = "resume-record-c";
 
 /// End-to-end mock behavior used by the local rusneb HTTP server.
 #[derive(Clone, Copy)]
@@ -46,6 +49,8 @@ enum MockMode {
     NoYearSearch,
     /// Serve a no-year prefix shard that only repeats IDs already discovered by year shards.
     NoYearKnownStop,
+    /// Serve overlapping pages used to verify resume after interrupted discovery and item fetch.
+    ResumePowerLoss,
 }
 
 /// Temporary directory removed automatically when the test exits.
@@ -627,6 +632,117 @@ fn crawl_resumes_interrupted_search_page() {
 }
 
 #[test]
+fn crawl_resumes_power_loss_mid_discovery_and_item_fetch() {
+    let workspace = TempWorkspace::new("resume-power-loss");
+    let server = MockRusnebServer::start(MockMode::ResumePowerLoss);
+    let db = workspace.join("state.sqlite");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--max-pages")
+            .arg("1")
+            .arg("--max-items")
+            .arg("0")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+
+    assert_eq!(search_page_status(&db, 1), "done");
+    assert_eq!(
+        item_ids(&db),
+        vec![RESUME_ID_A.to_string(), RESUME_ID_B.to_string()]
+    );
+    assert_eq!(search_item_count(&db), 2);
+
+    clone_search_page_from_existing_shard(&db, 1, 2, "in_progress");
+    mark_item_in_progress(&db, RESUME_ID_A);
+    assert_eq!(search_page_status(&db, 2), "in_progress");
+    assert_eq!(item_status(&db, RESUME_ID_A), "in_progress");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--max-pages")
+            .arg("3")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+
+    assert_eq!(
+        item_ids(&db),
+        vec![
+            RESUME_ID_A.to_string(),
+            RESUME_ID_B.to_string(),
+            RESUME_ID_C.to_string()
+        ]
+    );
+    assert_eq!(
+        record_ids(&db),
+        vec![
+            RESUME_ID_A.to_string(),
+            RESUME_ID_B.to_string(),
+            RESUME_ID_C.to_string()
+        ]
+    );
+    assert_eq!(item_status_count(&db, "done"), 3);
+    assert_eq!(item_status_count(&db, "pending"), 0);
+    assert_eq!(item_status_count(&db, "in_progress"), 0);
+    assert_eq!(search_page_status_count(&db, "done"), 3);
+    assert_eq!(search_page_status_count(&db, "in_progress"), 0);
+    assert_eq!(search_item_count(&db), 4);
+    assert_eq!(item_attempts(&db, RESUME_ID_A), 2);
+    assert_eq!(item_attempts(&db, RESUME_ID_B), 1);
+    assert_eq!(item_attempts(&db, RESUME_ID_C), 1);
+
+    let requests = server.requests();
+    assert_eq!(catalog_request_count(&requests, RESUME_ID_A), 1);
+    assert_eq!(catalog_request_count(&requests, RESUME_ID_B), 1);
+    assert_eq!(catalog_request_count(&requests, RESUME_ID_C), 1);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("/search/"))
+            .count(),
+        3
+    );
+
+    let report = run_ok(
+        Command::new(parser_bin())
+            .arg("report")
+            .arg("--db")
+            .arg(&db)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open"),
+    );
+    let report_stdout = String::from_utf8(report.stdout).expect("report stdout is UTF-8");
+    assert!(report_stdout.contains("completion ok"));
+    assert!(report_stdout.contains("records: 3"));
+}
+
+#[test]
 fn crawl_discovers_sorted_overflow_search_shards() {
     let workspace = TempWorkspace::new("overflow");
     let server = MockRusnebServer::start(MockMode::OverflowSearch);
@@ -1185,6 +1301,7 @@ fn route_response(
         MockMode::OverflowFacetSearch => route_overflow_facet_search(target),
         MockMode::NoYearSearch => route_no_year_search(target),
         MockMode::NoYearKnownStop => route_no_year_known_stop_search(target),
+        MockMode::ResumePowerLoss => route_resume_power_loss(target),
     }
 }
 
@@ -1390,6 +1507,45 @@ fn route_no_year_known_stop_search(target: &str) -> (u16, &'static str, String) 
     (200, "text/html; charset=utf-8", search_html(&[], 1))
 }
 
+/// Return overlapping pages and complete records for resume-after-power-loss assertions.
+fn route_resume_power_loss(target: &str) -> (u16, &'static str, String) {
+    if target.starts_with("/search/") {
+        if target.contains("PAGEN_1=2") {
+            return (
+                200,
+                "text/html; charset=utf-8",
+                search_html(&[RESUME_ID_B, RESUME_ID_C], 3),
+            );
+        }
+        if target.contains("PAGEN_1=3") {
+            return (200, "text/html; charset=utf-8", search_html(&[], 3));
+        }
+        return (
+            200,
+            "text/html; charset=utf-8",
+            search_html(&[RESUME_ID_A, RESUME_ID_B], 3),
+        );
+    }
+
+    if [RESUME_ID_A, RESUME_ID_B, RESUME_ID_C]
+        .iter()
+        .any(|id| target == format!("/catalog/{id}/"))
+    {
+        return (200, "text/html; charset=utf-8", card_html());
+    }
+    if target.starts_with("/local/components/exalead/search.page.detail/ajax/marcExport.php") {
+        return (200, "application/xml; charset=utf-8", marc_xml());
+    }
+    if target.starts_with("/rest_api/viewer/access/") {
+        return (
+            200,
+            "application/json; charset=utf-8",
+            r#"{"access":true}"#.to_string(),
+        );
+    }
+    (404, "text/plain; charset=utf-8", "not found".to_string())
+}
+
 /// Write one HTTP/1.1 response.
 fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
     let status_text = match status {
@@ -1546,6 +1702,16 @@ fn item_last_http_status(db: &Path, id: &str) -> Option<i64> {
     .expect("read item HTTP status")
 }
 
+/// Return all durable item IDs in stable order.
+fn item_ids(db: &Path) -> Vec<String> {
+    query_string_column(db, "SELECT id FROM items ORDER BY id")
+}
+
+/// Return all persisted record IDs in stable order.
+fn record_ids(db: &Path) -> Vec<String> {
+    query_string_column(db, "SELECT id FROM records ORDER BY id")
+}
+
 /// Return the status of one search page, independent of its generated search key.
 fn search_page_status(db: &Path, page: i64) -> String {
     let conn = Connection::open(db).expect("open SQLite DB");
@@ -1572,6 +1738,34 @@ fn clone_search_page_from_existing_shard(db: &Path, source_page: i64, new_page: 
     assert_eq!(updated, 1);
 }
 
+/// Mark an item as interrupted after it was claimed but before a record was saved.
+fn mark_item_in_progress(db: &Path, id: &str) {
+    let conn = Connection::open(db).expect("open SQLite DB");
+    let updated = conn
+        .execute(
+            "UPDATE items
+             SET status = 'in_progress',
+                 attempts = attempts + 1,
+                 last_error = NULL,
+                 last_http_status = NULL
+             WHERE id = ?1",
+            params![id],
+        )
+        .expect("mark item in progress");
+    assert_eq!(updated, 1);
+}
+
+/// Count items with one durable status.
+fn item_status_count(db: &Path, status: &str) -> i64 {
+    let conn = Connection::open(db).expect("open SQLite DB");
+    conn.query_row(
+        "SELECT COUNT(*) FROM items WHERE status = ?1",
+        params![status],
+        |row| row.get(0),
+    )
+    .expect("count item status")
+}
+
 /// Count search pages with one durable status.
 fn search_page_status_count(db: &Path, status: &str) -> i64 {
     let conn = Connection::open(db).expect("open SQLite DB");
@@ -1595,4 +1789,23 @@ fn clear_search_items(db: &Path) {
     let conn = Connection::open(db).expect("open SQLite DB");
     conn.execute("DELETE FROM search_items", [])
         .expect("clear search items");
+}
+
+/// Return one string column from SQLite in row order.
+fn query_string_column(db: &Path, sql: &str) -> Vec<String> {
+    let conn = Connection::open(db).expect("open SQLite DB");
+    let mut stmt = conn.prepare(sql).expect("prepare string column query");
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query string column");
+    rows.map(|row| row.expect("read string row")).collect()
+}
+
+/// Count how many catalog card fetches were made for one ID.
+fn catalog_request_count(requests: &[String], id: &str) -> usize {
+    let expected = format!("/catalog/{id}/");
+    requests
+        .iter()
+        .filter(|request| request.as_str() == expected)
+        .count()
 }
