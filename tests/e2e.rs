@@ -1,3 +1,4 @@
+use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -13,6 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MOCK_ID: &str = "mock-record-1";
 const MISSING_ID: &str = "missing-record";
+const TRANSIENT_ID: &str = "transient-record";
+const FORBIDDEN_ID: &str = "forbidden-record";
 const NO_YEAR_ID: &str = "no-year-record";
 const OVERFLOW_NORMAL_ID: &str = "overflow-normal";
 const OVERFLOW_SORTED_ID: &str = "overflow-sorted";
@@ -24,6 +27,10 @@ enum MockMode {
     CompleteRecord,
     /// Serve one search result whose card page returns HTTP 404.
     MissingRecord,
+    /// Serve one search result whose card page always returns HTTP 500.
+    TransientCard500,
+    /// Serve one search result whose card page always returns HTTP 403.
+    ForbiddenCard403,
     /// Serve two search result shards: the default year shard and one sorted overflow shard.
     OverflowSearch,
     /// Serve a no-publication-year prefix shard plus an empty year shard.
@@ -308,6 +315,174 @@ fn crawl_marks_card_404_as_terminal_missing() {
 }
 
 #[test]
+fn crawl_defers_repeated_card_500_without_spending_attempts() {
+    let workspace = TempWorkspace::new("transient");
+    let server = MockRusnebServer::start(MockMode::TransientCard500);
+    let db = workspace.join("state.sqlite");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--max-pages")
+            .arg("1")
+            .arg("--max-items")
+            .arg("2")
+            .arg("--workers")
+            .arg("1")
+            .arg("--max-attempts")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+
+    let requests = server.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request == &&format!("/catalog/{TRANSIENT_ID}/"))
+            .count(),
+        2
+    );
+    assert_eq!(item_status(&db, TRANSIENT_ID), "pending");
+    assert_eq!(item_attempts(&db, TRANSIENT_ID), 0);
+    assert_eq!(item_last_http_status(&db, TRANSIENT_ID), Some(500));
+
+    let stats = run_ok(Command::new(parser_bin()).arg("stats").arg("--db").arg(&db));
+    let stdout = String::from_utf8(stats.stdout).expect("stats stdout is UTF-8");
+    assert!(stdout.contains("records: 0"));
+    assert!(stdout.contains("  pending: 1"));
+    assert!(!stdout.contains("  failed: 1"));
+}
+
+#[test]
+fn crawl_exhausts_card_403_and_retry_failed_resets_it() {
+    let workspace = TempWorkspace::new("forbidden");
+    let server = MockRusnebServer::start(MockMode::ForbiddenCard403);
+    let db = workspace.join("state.sqlite");
+
+    let crawl = run_command(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--max-pages")
+            .arg("1")
+            .arg("--workers")
+            .arg("1")
+            .arg("--max-attempts")
+            .arg("2")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+    assert!(!crawl.status.success());
+    let stderr = String::from_utf8(crawl.stderr).expect("crawl stderr is UTF-8");
+    assert!(stderr.contains("failed HTTP 403 rows: items=1"));
+    assert!(stderr.contains("crawl incomplete: 1 failed item(s)"));
+
+    let requests = server.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request == &&format!("/catalog/{FORBIDDEN_ID}/"))
+            .count(),
+        2
+    );
+    assert_eq!(item_status(&db, FORBIDDEN_ID), "failed");
+    assert_eq!(item_attempts(&db, FORBIDDEN_ID), 2);
+    assert_eq!(item_last_http_status(&db, FORBIDDEN_ID), Some(403));
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("retry-failed")
+            .arg("--db")
+            .arg(&db)
+            .arg("--http-status")
+            .arg("403"),
+    );
+    assert_eq!(item_status(&db, FORBIDDEN_ID), "pending");
+    assert_eq!(item_attempts(&db, FORBIDDEN_ID), 0);
+    assert_eq!(item_last_http_status(&db, FORBIDDEN_ID), None);
+}
+
+#[test]
+fn crawl_resumes_interrupted_search_page() {
+    let workspace = TempWorkspace::new("interrupted-search");
+    let server = MockRusnebServer::start(MockMode::CompleteRecord);
+    let db = workspace.join("state.sqlite");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--max-pages")
+            .arg("1")
+            .arg("--max-items")
+            .arg("0")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+    assert_eq!(search_page_status(&db, 1), "done");
+
+    clone_search_page_from_existing_shard(&db, 1, 2, "in_progress");
+    assert_eq!(search_page_status(&db, 2), "in_progress");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--max-pages")
+            .arg("2")
+            .arg("--max-items")
+            .arg("0")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+
+    assert_eq!(search_page_status(&db, 2), "done");
+    assert_eq!(search_page_status_count(&db, "in_progress"), 0);
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.starts_with("/search/"))
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn crawl_discovers_sorted_overflow_search_shards() {
     let workspace = TempWorkspace::new("overflow");
     let server = MockRusnebServer::start(MockMode::OverflowSearch);
@@ -555,6 +730,8 @@ fn route_response(mode: MockMode, target: &str) -> (u16, &'static str, String) {
     match mode {
         MockMode::CompleteRecord => route_complete_record(target),
         MockMode::MissingRecord => route_missing_record(target),
+        MockMode::TransientCard500 => route_transient_card_500(target),
+        MockMode::ForbiddenCard403 => route_forbidden_card_403(target),
         MockMode::OverflowSearch => route_overflow_search(target),
         MockMode::NoYearSearch => route_no_year_search(target),
     }
@@ -596,6 +773,36 @@ fn route_missing_record(target: &str) -> (u16, &'static str, String) {
     (404, "text/plain; charset=utf-8", "not found".to_string())
 }
 
+/// Return the transient-card mock response for a request target.
+fn route_transient_card_500(target: &str) -> (u16, &'static str, String) {
+    if target.starts_with("/search/") {
+        return (
+            200,
+            "text/html; charset=utf-8",
+            search_html(&[TRANSIENT_ID], 1),
+        );
+    }
+    if target == format!("/catalog/{TRANSIENT_ID}/") {
+        return (500, "text/plain; charset=utf-8", "server error".to_string());
+    }
+    (404, "text/plain; charset=utf-8", "not found".to_string())
+}
+
+/// Return the forbidden-card mock response for a request target.
+fn route_forbidden_card_403(target: &str) -> (u16, &'static str, String) {
+    if target.starts_with("/search/") {
+        return (
+            200,
+            "text/html; charset=utf-8",
+            search_html(&[FORBIDDEN_ID], 1),
+        );
+    }
+    if target == format!("/catalog/{FORBIDDEN_ID}/") {
+        return (403, "text/plain; charset=utf-8", "forbidden".to_string());
+    }
+    (404, "text/plain; charset=utf-8", "not found".to_string())
+}
+
 /// Return the overflow-shard mock response for a request target.
 fn route_overflow_search(target: &str) -> (u16, &'static str, String) {
     if !target.starts_with("/search/") {
@@ -632,7 +839,9 @@ fn route_no_year_search(target: &str) -> (u16, &'static str, String) {
 fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
     let status_text = match status {
         200 => "OK",
+        403 => "Forbidden",
         404 => "Not Found",
+        500 => "Internal Server Error",
         _ => "OK",
     };
     write!(
@@ -737,4 +946,74 @@ fn assert_hex_sha256(value: &Value) {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
         "invalid SHA-256 hex digest: {digest}"
     );
+}
+
+/// Return the durable item status for a catalog ID.
+fn item_status(db: &Path, id: &str) -> String {
+    let conn = Connection::open(db).expect("open SQLite DB");
+    conn.query_row(
+        "SELECT status FROM items WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )
+    .expect("read item status")
+}
+
+/// Return the durable item attempt counter for a catalog ID.
+fn item_attempts(db: &Path, id: &str) -> i64 {
+    let conn = Connection::open(db).expect("open SQLite DB");
+    conn.query_row(
+        "SELECT attempts FROM items WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )
+    .expect("read item attempts")
+}
+
+/// Return the durable item HTTP status for a catalog ID.
+fn item_last_http_status(db: &Path, id: &str) -> Option<i64> {
+    let conn = Connection::open(db).expect("open SQLite DB");
+    conn.query_row(
+        "SELECT last_http_status FROM items WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )
+    .expect("read item HTTP status")
+}
+
+/// Return the status of one search page, independent of its generated search key.
+fn search_page_status(db: &Path, page: i64) -> String {
+    let conn = Connection::open(db).expect("open SQLite DB");
+    conn.query_row(
+        "SELECT status FROM search_pages WHERE page = ?1",
+        params![page],
+        |row| row.get(0),
+    )
+    .expect("read search page status")
+}
+
+/// Clone an existing shard row to simulate an interrupted durable search page.
+fn clone_search_page_from_existing_shard(db: &Path, source_page: i64, new_page: i64, status: &str) {
+    let conn = Connection::open(db).expect("open SQLite DB");
+    let updated = conn
+        .execute(
+            "INSERT INTO search_pages(search_key, page, params_json, status, updated_at)
+             SELECT search_key, ?2, params_json, ?3, updated_at
+             FROM search_pages
+             WHERE page = ?1",
+            params![source_page, new_page, status],
+        )
+        .expect("clone search page");
+    assert_eq!(updated, 1);
+}
+
+/// Count search pages with one durable status.
+fn search_page_status_count(db: &Path, status: &str) -> i64 {
+    let conn = Connection::open(db).expect("open SQLite DB");
+    conn.query_row(
+        "SELECT COUNT(*) FROM search_pages WHERE status = ?1",
+        params![status],
+        |row| row.get(0),
+    )
+    .expect("count search page status")
 }
