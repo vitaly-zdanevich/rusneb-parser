@@ -1,5 +1,17 @@
 # rusneb-parser
 
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_rusneb-parser&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_rusneb-parser)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_rusneb-parser&metric=coverage)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_rusneb-parser)
+[![Bugs](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_rusneb-parser&metric=bugs)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_rusneb-parser)
+[![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_rusneb-parser&metric=vulnerabilities)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_rusneb-parser)
+[![Code Smells](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_rusneb-parser&metric=code_smells)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_rusneb-parser)
+[![Duplicated Lines](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_rusneb-parser&metric=duplicated_lines_density)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_rusneb-parser)
+[![Maintainability](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_rusneb-parser&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_rusneb-parser)
+[![Reliability](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_rusneb-parser&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_rusneb-parser)
+[![Security](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_rusneb-parser&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_rusneb-parser)
+[![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_rusneb-parser&metric=ncloc)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_rusneb-parser)
+[![Technical Debt](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_rusneb-parser&metric=sqale_index)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_rusneb-parser)
+
 Metadata crawler for [rusneb.ru](https://rusneb.ru/).
 
 The crawler is deliberately conservative by default: it uses one item fetch worker, a configurable delay between requests, and a SQLite state file for crash-safe resume. The item worker maximum can be increased with `--workers`; search-page discovery stays single-threaded and keeps only a small item backlog ahead of the workers. Adaptive worker limiting is enabled by default for multi-worker crawls: transient server errors and timeout bursts lower the active worker count, and sustained successful fetches raise it again. If card/search transient errors happen repeatedly, affected rows are put back to `pending` without spending retry attempts, the crawler pauses, and then retries. Final data can be exported as JSON Lines (`.jsonl`, `.jsonl.gz`, `.jsonl.xz`) and, with the default feature set, Parquet.

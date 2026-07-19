@@ -5,6 +5,7 @@
 /state/
 /out/
 /logs/
+/coverage/
 
 # Local/editor noise
 .env
