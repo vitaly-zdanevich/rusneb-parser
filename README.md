@@ -116,6 +116,18 @@ cargo run -- export-jsonl --output out/rusneb.jsonl.xz
 cargo run -- export-parquet --output out/rusneb.parquet
 ```
 
+Export a companion manifest for sharing dataset archives:
+
+```sh
+cargo run -- export-manifest \
+  --output out/manifest.json \
+  --crawl-command './continue.sh' \
+  --file out/rusneb.jsonl.xz \
+  --file out/rusneb.parquet
+```
+
+The manifest records the parser version, git revision when available, SQLite crawl counts, failed item diagnostics, inferred state start/finish timestamps, and SHA-256 hashes for every `--file`.
+
 Print checkpoint state:
 
 ```sh

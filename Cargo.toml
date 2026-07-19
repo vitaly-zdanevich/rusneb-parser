@@ -1,6 +1,6 @@
 [package]
 name = "rusneb-parser"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 license = "MIT"
 
@@ -25,5 +25,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 scraper = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
 url = "2"
 xz2 = "0.1"

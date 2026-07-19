@@ -1,5 +1,6 @@
 mod db;
 mod export;
+mod manifest;
 mod model;
 mod rusneb;
 
@@ -39,6 +40,8 @@ enum Command {
     ExportJsonl(ExportJsonlArgs),
     /// Export a flattened Parquet file plus the full JSON record column.
     ExportParquet(ExportParquetArgs),
+    /// Export a JSON manifest describing the crawl state and output files.
+    ExportManifest(ExportManifestArgs),
     /// Print durable crawl state counts.
     Stats(StatsArgs),
     /// Validate whether completed search pages cover rusneb-reported result totals.
@@ -245,6 +248,36 @@ struct ExportParquetArgs {
     /// Rows per Arrow/Parquet batch.
     #[arg(long, default_value_t = 2048)]
     batch_size: usize,
+}
+
+#[derive(Debug, Args)]
+struct ExportManifestArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Output manifest JSON path.
+    #[arg(long, default_value = "out/manifest.json")]
+    output: PathBuf,
+
+    /// Human-readable dataset name stored in the manifest.
+    #[arg(long, default_value = "rusneb metadata")]
+    dataset_name: String,
+
+    /// Crawl command to record in the manifest. Pass the real command or script used for the dataset.
+    #[arg(long)]
+    crawl_command: Option<String>,
+
+    /// Output file to include with size and SHA-256 hash. Repeatable.
+    #[arg(long = "file")]
+    files: Vec<PathBuf>,
+
+    /// Maximum attempts used to classify retryable and exhausted failures in the summary.
+    #[arg(long, default_value_t = 5)]
+    max_attempts: u32,
+
+    /// Maximum failed item IDs to include as a diagnostic sample.
+    #[arg(long, default_value_t = 50)]
+    failed_item_sample: u64,
 }
 
 #[derive(Debug, Args)]
@@ -524,6 +557,12 @@ fn main() -> Result<()> {
             let db = Db::open(&args.common.db)?;
             let count = export::export_parquet(&db, &args.output, args.batch_size)?;
             eprintln!("exported {count} records to {}", args.output.display());
+            Ok(())
+        }
+        Command::ExportManifest(args) => {
+            let db = Db::open(&args.common.db)?;
+            manifest::export_manifest(&db, &args)?;
+            eprintln!("exported manifest to {}", args.output.display());
             Ok(())
         }
         Command::Stats(args) => print_stats(args),

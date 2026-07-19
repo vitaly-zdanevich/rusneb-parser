@@ -47,6 +47,30 @@ pub struct RetryFailedCounts {
     pub search_pages: u64,
 }
 
+/// Time range covered by durable crawl state rows.
+#[derive(Debug, Default)]
+pub struct StateTimeBounds {
+    pub started_at_unix: Option<i64>,
+    pub finished_at_unix: Option<i64>,
+}
+
+/// Count of failed item rows grouped by their last HTTP status.
+#[derive(Debug)]
+pub struct FailedHttpStatusCount {
+    pub http_status: Option<u16>,
+    pub count: u64,
+}
+
+/// Diagnostic sample row for a failed item.
+#[derive(Debug)]
+pub struct FailedItemSample {
+    pub id: String,
+    pub attempts: u32,
+    pub last_http_status: Option<u16>,
+    pub last_error: Option<String>,
+    pub updated_at_unix: i64,
+}
+
 /// Aggregated search coverage information for all discovered search shards.
 #[derive(Debug, Default)]
 pub struct CoverageReport {
@@ -590,6 +614,75 @@ impl Db {
             items: items as u64,
             search_pages: search_pages as u64,
         })
+    }
+
+    /// Return the earliest and latest timestamps found in records and work queues.
+    pub fn state_time_bounds(&self) -> Result<StateTimeBounds> {
+        let (started_at_unix, finished_at_unix) = self.conn.query_row(
+            "SELECT MIN(value), MAX(value)
+             FROM (
+                 SELECT updated_at AS value FROM items
+                 UNION ALL
+                 SELECT updated_at AS value FROM search_pages
+                 UNION ALL
+                 SELECT fetched_at AS value FROM records
+             )",
+            [],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )?;
+        Ok(StateTimeBounds {
+            started_at_unix,
+            finished_at_unix,
+        })
+    }
+
+    /// Return failed item counts grouped by their last HTTP status.
+    pub fn failed_item_http_status_counts(&self) -> Result<Vec<FailedHttpStatusCount>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT last_http_status, COUNT(*)
+             FROM items
+             WHERE status = 'failed'
+             GROUP BY last_http_status
+             ORDER BY COUNT(*) DESC, last_http_status",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(FailedHttpStatusCount {
+                http_status: row.get::<_, Option<i64>>(0)?.map(|status| status as u16),
+                count: row.get::<_, i64>(1)? as u64,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Return a bounded diagnostic sample of failed item IDs and their latest error details.
+    pub fn failed_item_sample(&self, limit: u64) -> Result<Vec<FailedItemSample>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, attempts, last_http_status, last_error, updated_at
+             FROM items
+             WHERE status = 'failed'
+             ORDER BY attempts DESC, updated_at DESC, id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(FailedItemSample {
+                id: row.get(0)?,
+                attempts: row.get::<_, i64>(1)? as u32,
+                last_http_status: row.get::<_, Option<i64>>(2)?.map(|status| status as u16),
+                last_error: row.get(3)?,
+                updated_at_unix: row.get(4)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Aggregate completed search pages and reported totals by search shard.

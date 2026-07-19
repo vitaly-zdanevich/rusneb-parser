@@ -129,6 +129,7 @@ fn crawl_persists_record_resumes_and_exports_jsonl() {
     let server = MockRusnebServer::start(MockMode::CompleteRecord);
     let db = workspace.join("state.sqlite");
     let output = workspace.join("out.jsonl");
+    let manifest = workspace.join("manifest.json");
 
     run_ok(
         Command::new(parser_bin())
@@ -192,6 +193,19 @@ fn crawl_persists_record_resumes_and_exports_jsonl() {
         String::from_utf8(validation.stdout).expect("validation stdout is UTF-8");
     assert!(validation_stdout.contains("coverage ok"));
 
+    run_ok(
+        Command::new(parser_bin())
+            .arg("export-manifest")
+            .arg("--db")
+            .arg(&db)
+            .arg("--output")
+            .arg(&manifest)
+            .arg("--crawl-command")
+            .arg("rusneb-parser crawl --catalog 25 --access open")
+            .arg("--file")
+            .arg(&output),
+    );
+
     let jsonl = fs::read_to_string(&output).expect("read exported JSONL");
     let lines = jsonl.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 1);
@@ -220,6 +234,24 @@ fn crawl_persists_record_resumes_and_exports_jsonl() {
     assert_eq!(record["viewer_access"]["access"], true);
     assert!(record["viewer_access"].get("token").is_none());
     assert!(record["viewer_access"].get("viewer").is_none());
+
+    let manifest_json: Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).expect("read manifest"))
+            .expect("parse manifest JSON");
+    assert_eq!(manifest_json["schema_version"], 1);
+    assert_eq!(manifest_json["tool"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        manifest_json["commands"]["crawl"],
+        "rusneb-parser crawl --catalog 25 --access open"
+    );
+    assert_eq!(manifest_json["sqlite"]["records"], 1);
+    assert_eq!(manifest_json["sqlite"]["items"]["done"], 1);
+    assert_eq!(manifest_json["failed_items"]["total"], 0);
+    assert_eq!(
+        manifest_json["outputs"][0]["bytes"],
+        fs::metadata(&output).expect("read output metadata").len()
+    );
+    assert_hex_sha256(&manifest_json["outputs"][0]["sha256"]);
 }
 
 #[test]
@@ -692,5 +724,17 @@ fn assert_json_array_contains(value: &Value, expected: &str) {
     assert!(
         values.iter().any(|value| value.as_str() == Some(expected)),
         "expected {expected:?} in {values:?}"
+    );
+}
+
+/// Assert that a JSON value contains a lowercase SHA-256 hex digest.
+fn assert_hex_sha256(value: &Value) {
+    let digest = value.as_str().expect("expected SHA-256 string");
+    assert_eq!(digest.len(), 64);
+    assert!(
+        digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "invalid SHA-256 hex digest: {digest}"
     );
 }
