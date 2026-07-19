@@ -60,7 +60,20 @@ cargo run -- crawl --catalog 25 --access open \
 Equivalent rusneb.ru search filter:
 <https://rusneb.ru/search/?q=&c[]=25&access[]=open&publishyear_prev=1800&publishyear_next=2026>
 
-Each year gets a separate SQLite search checkpoint. Records already saved from earlier broad crawls are skipped by ID. If a single year still reaches the rusneb.ru pagination window limit, split it further with narrower filters.
+Each year gets a separate SQLite search checkpoint. Records already saved from earlier broad crawls are skipped by ID.
+
+rusneb.ru can report more than 9,990 results for one query while returning zero records after page 666. For such years, add sorted overflow shards. They discover the same year through a different ordering, which exposes records hidden behind that search window. SQLite still de-duplicates item IDs, so already saved records are not fetched again:
+
+```sh
+cargo run -- crawl --catalog 25 --access open \
+  --publishyear-prev 1 --publishyear-next 2026 --shard-years \
+  --overflow-year 1911 --overflow-year 1912 \
+  --overflow-sort document_titlesort:desc \
+  --workers 8
+```
+
+Equivalent rusneb.ru overflow filter for 1911:
+<https://rusneb.ru/search/?by=document_titlesort&order=desc&q=&c[]=25&access[]=open&publishyear_prev=1911&publishyear_next=1911>
 
 Start at five workers, allow adaptive limiting to drop as low as three, then recover after stable successful fetches:
 
@@ -112,8 +125,8 @@ sqlite3 -header -column state/rusneb.sqlite \
 The GitHub Actions workflow runs tests on pushes and pull requests. Pushing any git tag builds release archives for Linux, Windows, macOS, and Android, then publishes them to GitHub Releases. The Android artifact is a raw `aarch64-linux-android` command-line binary, not an APK.
 
 ```sh
-git tag v0.1.8
-git push origin v0.1.8
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 ## Resume Model

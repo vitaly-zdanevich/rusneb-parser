@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use db::Db;
 use rusneb::{RusnebClient, SearchParams};
+use std::collections::BTreeSet;
 use std::io::BufRead;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::num::NonZeroUsize;
@@ -81,6 +82,14 @@ struct CrawlArgs {
     /// Split discovery into one search stream per year in the inclusive publishyear range.
     #[arg(long)]
     shard_years: bool,
+
+    /// Add extra sorted search streams for this year. Repeatable; use when one year exceeds rusneb's search window.
+    #[arg(long = "overflow-year")]
+    overflow_years: Vec<u32>,
+
+    /// Sort shard for each --overflow-year, formatted as field:asc or field:desc. Repeatable.
+    #[arg(long = "overflow-sort")]
+    overflow_sorts: Vec<String>,
 
     /// Search sort field. Example: document_publishyearsort.
     #[arg(long)]
@@ -231,6 +240,12 @@ struct SearchJob {
     params: SearchParams,
     search_key: String,
     params_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchSort {
+    field: String,
+    order: String,
 }
 
 #[derive(Debug)]
@@ -466,6 +481,7 @@ fn main() -> Result<()> {
 
 fn build_search_jobs(args: &CrawlArgs) -> Result<Vec<SearchJob>> {
     let extra = parse_extra_params(&args.extra_params)?;
+    let overflow_sorts = parse_overflow_sorts(&args.overflow_sorts)?;
     let base_params = SearchParams {
         base_url: args.base_url.clone(),
         query: args.query.clone(),
@@ -479,7 +495,16 @@ fn build_search_jobs(args: &CrawlArgs) -> Result<Vec<SearchJob>> {
     };
 
     if !args.shard_years {
+        if !args.overflow_years.is_empty() || !overflow_sorts.is_empty() {
+            anyhow::bail!("--overflow-year and --overflow-sort require --shard-years");
+        }
         return Ok(vec![make_search_job("default".to_string(), base_params)?]);
+    }
+    if !args.overflow_years.is_empty() && overflow_sorts.is_empty() {
+        anyhow::bail!("--overflow-year requires at least one --overflow-sort");
+    }
+    if args.overflow_years.is_empty() && !overflow_sorts.is_empty() {
+        anyhow::bail!("--overflow-sort requires at least one --overflow-year");
     }
 
     let from_year = parse_year_bound("--publishyear-prev", args.publishyear_prev.as_deref())?;
@@ -490,13 +515,40 @@ fn build_search_jobs(args: &CrawlArgs) -> Result<Vec<SearchJob>> {
         );
     }
 
-    let mut jobs = Vec::with_capacity((to_year - from_year + 1) as usize);
+    let overflow_years = args.overflow_years.iter().copied().collect::<BTreeSet<_>>();
+    for year in &overflow_years {
+        if *year < from_year || *year > to_year {
+            anyhow::bail!(
+                "--overflow-year {year} is outside --publishyear-prev..--publishyear-next"
+            );
+        }
+    }
+
+    let mut jobs = Vec::with_capacity(
+        (to_year - from_year + 1) as usize
+            + overflow_years.len().saturating_mul(overflow_sorts.len()),
+    );
     for year in from_year..=to_year {
         let mut params = base_params.clone();
-        let year = year.to_string();
-        params.publishyear_prev = Some(year.clone());
-        params.publishyear_next = Some(year.clone());
-        jobs.push(make_search_job(format!("year {year}"), params)?);
+        let year_string = year.to_string();
+        params.publishyear_prev = Some(year_string.clone());
+        params.publishyear_next = Some(year_string.clone());
+        jobs.push(make_search_job(
+            format!("year {year_string}"),
+            params.clone(),
+        )?);
+
+        if overflow_years.contains(&year) {
+            for sort in &overflow_sorts {
+                let mut sorted_params = params.clone();
+                sorted_params.sort_by = Some(sort.field.clone());
+                sorted_params.order = Some(sort.order.clone());
+                jobs.push(make_search_job(
+                    format!("year {year_string} sort {}:{}", sort.field, sort.order),
+                    sorted_params,
+                )?);
+            }
+        }
     }
     Ok(jobs)
 }
@@ -1195,6 +1247,32 @@ fn parse_extra_params(values: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
+fn parse_overflow_sorts(values: &[String]) -> Result<Vec<SearchSort>> {
+    let mut sorts = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let Some((field, order)) = value.split_once(':') else {
+            anyhow::bail!("overflow sort must be field:asc or field:desc: {value}");
+        };
+        let field = field.trim();
+        let order = order.trim().to_ascii_lowercase();
+        if field.is_empty() {
+            anyhow::bail!("overflow sort field must not be empty: {value}");
+        }
+        if order != "asc" && order != "desc" {
+            anyhow::bail!("overflow sort order must be asc or desc: {value}");
+        }
+        let key = (field.to_string(), order.clone());
+        if seen.insert(key.clone()) {
+            sorts.push(SearchSort {
+                field: key.0,
+                order: key.1,
+            });
+        }
+    }
+    Ok(sorts)
+}
+
 fn stable_search_key(params_json: &str) -> String {
     let digest = fnv1a64(params_json.as_bytes());
     format!("{digest:016x}")
@@ -1207,4 +1285,73 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_overflow_sort_jobs_only_for_selected_years() {
+        let cli = Cli::parse_from([
+            "rusneb-parser",
+            "crawl",
+            "--publishyear-prev",
+            "1911",
+            "--publishyear-next",
+            "1912",
+            "--shard-years",
+            "--overflow-year",
+            "1911",
+            "--overflow-sort",
+            "document_titlesort:desc",
+        ]);
+        let Command::Crawl(args) = cli.command else {
+            panic!("expected crawl command");
+        };
+
+        let jobs = build_search_jobs(&args).unwrap();
+
+        assert_eq!(
+            jobs.iter()
+                .map(|job| job.label.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "year 1911",
+                "year 1911 sort document_titlesort:desc",
+                "year 1912"
+            ]
+        );
+        assert_eq!(jobs[0].params.sort_by, None);
+        assert_eq!(
+            jobs[1].params.sort_by.as_deref(),
+            Some("document_titlesort")
+        );
+        assert_eq!(jobs[1].params.order.as_deref(), Some("desc"));
+        assert_eq!(jobs[2].params.sort_by, None);
+    }
+
+    #[test]
+    fn parses_and_deduplicates_overflow_sorts() {
+        let sorts = parse_overflow_sorts(&[
+            "document_titlesort:DESC".to_string(),
+            "document_titlesort:desc".to_string(),
+            "document_authorsort:asc".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            sorts,
+            vec![
+                SearchSort {
+                    field: "document_titlesort".to_string(),
+                    order: "desc".to_string()
+                },
+                SearchSort {
+                    field: "document_authorsort".to_string(),
+                    order: "asc".to_string()
+                }
+            ]
+        );
+    }
 }

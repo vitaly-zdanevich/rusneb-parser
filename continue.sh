@@ -8,10 +8,12 @@ mkdir -p "$log_dir"
 
 parser=()
 if [[ -x ./target-codex/release/rusneb-parser ]] &&
-  ./target-codex/release/rusneb-parser crawl --help | grep -q -- "--ssh"; then
+  ./target-codex/release/rusneb-parser crawl --help | grep -q -- "--ssh" &&
+  ./target-codex/release/rusneb-parser crawl --help | grep -q -- "--overflow-year"; then
   parser=(./target-codex/release/rusneb-parser)
 elif [[ -x ./target/release/rusneb-parser ]] &&
-  ./target/release/rusneb-parser crawl --help | grep -q -- "--ssh"; then
+  ./target/release/rusneb-parser crawl --help | grep -q -- "--ssh" &&
+  ./target/release/rusneb-parser crawl --help | grep -q -- "--overflow-year"; then
   parser=(./target/release/rusneb-parser)
 else
   parser=(cargo run --release --)
@@ -23,6 +25,8 @@ echo "Resetting failed HTTP 403 rows to pending..."
 nohup "${parser[@]}" crawl \
   --catalog 25 --access open \
   --publishyear-prev 1 --publishyear-next 2026 --shard-years \
+  --overflow-year 1911 --overflow-year 1912 \
+  --overflow-sort document_titlesort:desc \
   --workers 8 \
   --max-consecutive-transport-errors 16 \
   --transient-error-pause-secs 120 \
