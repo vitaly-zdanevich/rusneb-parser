@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::BufRead;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::{
     Arc,
@@ -1991,9 +1991,22 @@ fn report(args: ReportArgs) -> Result<()> {
     let coverage = coverage_validation_summary(&db, &args.coverage)?;
     let failed_statuses = db.failed_item_http_status_counts()?;
     let failed_sample = db.failed_item_sample(args.failed_item_sample)?;
+    let db_path = absolute_display_path(&args.coverage.common.db);
+    let db_size_bytes = std::fs::metadata(&args.coverage.common.db)
+        .with_context(|| {
+            format!(
+                "reading SQLite database metadata from {}",
+                args.coverage.common.db.display()
+            )
+        })?
+        .len();
 
     println!("completion report:");
-    println!("  db: {}", args.coverage.common.db.display());
+    println!("  db: {db_path}");
+    println!(
+        "  db_size: {} ({db_size_bytes} bytes)",
+        human_readable_bytes(db_size_bytes)
+    );
     println!("  records: {}", state.records);
     print_work_status_summary("items", &state.items);
     println!("    retryable_failed: {}", state.retryable_failed_items);
@@ -2089,6 +2102,36 @@ fn unfinished_work(summary: &db::CrawlCompletionSummary) -> u64 {
         + summary.search_pages.pending
         + summary.search_pages.in_progress
         + summary.retryable_failed_search_pages
+}
+
+/// Return an absolute path for display without requiring every platform to support canonicalize.
+fn absolute_display_path(path: &Path) -> String {
+    let absolute = path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    });
+    absolute.display().to_string()
+}
+
+/// Format byte counts using binary units while preserving the exact byte count separately.
+fn human_readable_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 fn coverage_validation_summary(
@@ -2690,5 +2733,14 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn formats_human_readable_byte_counts() {
+        assert_eq!(human_readable_bytes(0), "0 B");
+        assert_eq!(human_readable_bytes(1), "1 B");
+        assert_eq!(human_readable_bytes(1024), "1.0 KiB");
+        assert_eq!(human_readable_bytes(1_536), "1.5 KiB");
+        assert_eq!(human_readable_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
     }
 }

@@ -240,6 +240,14 @@ fn crawl_persists_record_resumes_and_exports_jsonl() {
     let report_stdout = String::from_utf8(report.stdout).expect("report stdout is UTF-8");
     assert!(report_stdout.contains("completion ok"));
     assert!(report_stdout.contains("records: 1"));
+    assert!(report_stdout.contains(&format!(
+        "db: {}",
+        db.canonicalize()
+            .expect("canonicalize test database")
+            .display()
+    )));
+    assert!(report_stdout.contains("db_size: "));
+    assert!(report_stdout.contains(" bytes)"));
 
     run_ok(
         Command::new(parser_bin())
