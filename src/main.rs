@@ -875,6 +875,36 @@ fn write_search_jobs_meta(db: &Db, search_jobs: &[SearchJob]) -> Result<()> {
     db.set_meta("search_params", &search_jobs_json)
 }
 
+/// Add newly discovered search shards to both the in-memory queue and durable metadata.
+fn queue_search_jobs(
+    db: &Db,
+    search_jobs: &mut Vec<SearchJob>,
+    pending_jobs: &mut VecDeque<SearchJob>,
+    new_jobs: Vec<SearchJob>,
+) -> Result<()> {
+    if new_jobs.is_empty() {
+        return Ok(());
+    }
+
+    for new_job in &new_jobs {
+        pending_jobs.push_back(new_job.clone());
+    }
+    search_jobs.extend(new_jobs);
+    write_search_jobs_meta(db, search_jobs)
+}
+
+/// Scan all known shards after the discovery queue drains and seed any new overflow work.
+fn seed_auto_overflow_jobs_for_known_gaps(
+    ctx: &mut AutoOverflowContext<'_>,
+    search_jobs: &[SearchJob],
+) -> Result<Vec<SearchJob>> {
+    let mut new_jobs = Vec::new();
+    for job in search_jobs {
+        new_jobs.extend(seed_auto_overflow_jobs(ctx, job)?);
+    }
+    Ok(new_jobs)
+}
+
 fn seed_auto_overflow_jobs(
     ctx: &mut AutoOverflowContext<'_>,
     source_job: &SearchJob,
@@ -1231,36 +1261,69 @@ fn crawl(args: CrawlArgs) -> Result<()> {
                 let mut pending_jobs = VecDeque::from(search_jobs.clone());
                 let mut overflow_facet_values = None;
                 let mut result = Ok(());
-                while let Some(job) = pending_jobs.pop_front() {
-                    if shutdown.load(Ordering::SeqCst) {
+                loop {
+                    while let Some(job) = pending_jobs.pop_front() {
+                        if shutdown.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        eprintln!(
+                            "discovering search shard {} ({})",
+                            job.label, job.search_key
+                        );
+                        result = run_search_discovery(
+                            &args,
+                            &mut db,
+                            &mut client,
+                            &job.params,
+                            &job.search_key,
+                            &job.params_json,
+                            job.max_pages,
+                            job.stop_after_known_pages,
+                            &shutdown,
+                            &consecutive_transient_errors,
+                            &consecutive_403_errors,
+                            &transient_pause_until,
+                            &worker_control,
+                            transient_error_pause_threshold,
+                            transient_error_pause,
+                            http_403_pause_threshold,
+                            http_403_pause,
+                        );
+                        if result.is_err() {
+                            break;
+                        }
+                        let mut auto_overflow_ctx = AutoOverflowContext {
+                            args: &args,
+                            db: &db,
+                            client: &mut client,
+                            overflow_sorts: &overflow_sorts,
+                            overflow_facets: &overflow_facets,
+                            overflow_facet_values: &mut overflow_facet_values,
+                            queued_search_keys: &mut queued_search_keys,
+                        };
+                        match seed_auto_overflow_jobs(&mut auto_overflow_ctx, &job) {
+                            Ok(new_jobs) => {
+                                if let Err(error) = queue_search_jobs(
+                                    &db,
+                                    &mut search_jobs,
+                                    &mut pending_jobs,
+                                    new_jobs,
+                                ) {
+                                    result = Err(error);
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                result = Err(error);
+                                break;
+                            }
+                        }
+                    }
+
+                    if result.is_err() || shutdown.load(Ordering::SeqCst) {
                         break;
                     }
-                    eprintln!(
-                        "discovering search shard {} ({})",
-                        job.label, job.search_key
-                    );
-                    result = run_search_discovery(
-                        &args,
-                        &mut db,
-                        &mut client,
-                        &job.params,
-                        &job.search_key,
-                        &job.params_json,
-                        job.max_pages,
-                        job.stop_after_known_pages,
-                        &shutdown,
-                        &consecutive_transient_errors,
-                        &consecutive_403_errors,
-                        &transient_pause_until,
-                        &worker_control,
-                        transient_error_pause_threshold,
-                        transient_error_pause,
-                        http_403_pause_threshold,
-                        http_403_pause,
-                    );
-                    if result.is_err() {
-                        break;
-                    }
+
                     let mut auto_overflow_ctx = AutoOverflowContext {
                         args: &args,
                         db: &db,
@@ -1270,17 +1333,27 @@ fn crawl(args: CrawlArgs) -> Result<()> {
                         overflow_facet_values: &mut overflow_facet_values,
                         queued_search_keys: &mut queued_search_keys,
                     };
-                    match seed_auto_overflow_jobs(&mut auto_overflow_ctx, &job) {
+                    match seed_auto_overflow_jobs_for_known_gaps(
+                        &mut auto_overflow_ctx,
+                        &search_jobs,
+                    ) {
                         Ok(new_jobs) => {
-                            if !new_jobs.is_empty() {
-                                for new_job in &new_jobs {
-                                    pending_jobs.push_back(new_job.clone());
-                                }
-                                search_jobs.extend(new_jobs);
-                                if let Err(error) = write_search_jobs_meta(&db, &search_jobs) {
-                                    result = Err(error);
-                                    break;
-                                }
+                            if new_jobs.is_empty() {
+                                break;
+                            }
+                            eprintln!(
+                                "self-healing coverage scan queued {} automatic overflow shard{}",
+                                new_jobs.len(),
+                                if new_jobs.len() == 1 { "" } else { "s" }
+                            );
+                            if let Err(error) = queue_search_jobs(
+                                &db,
+                                &mut search_jobs,
+                                &mut pending_jobs,
+                                new_jobs,
+                            ) {
+                                result = Err(error);
+                                break;
                             }
                         }
                         Err(error) => {

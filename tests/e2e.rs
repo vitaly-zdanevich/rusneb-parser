@@ -25,6 +25,12 @@ const OVERFLOW_LANG_C_ID: &str = "overflow-lang-c";
 const RESUME_ID_A: &str = "resume-record-a";
 const RESUME_ID_B: &str = "resume-record-b";
 const RESUME_ID_C: &str = "resume-record-c";
+const TOTAL_DRIFT_ID_A: &str = "total-drift-a";
+const TOTAL_DRIFT_ID_B: &str = "total-drift-b";
+const FINAL_SCAN_ID_A: &str = "final-scan-a";
+const FINAL_SCAN_ID_B: &str = "final-scan-b";
+const FINAL_SCAN_ID_C: &str = "final-scan-c";
+const FINAL_SCAN_ID_D: &str = "final-scan-d";
 
 /// End-to-end mock behavior used by the local rusneb HTTP server.
 #[derive(Clone, Copy)]
@@ -51,6 +57,10 @@ enum MockMode {
     NoYearKnownStop,
     /// Serve overlapping pages used to verify resume after interrupted discovery and item fetch.
     ResumePowerLoss,
+    /// Serve search pages whose reported total decreases before the terminal empty page.
+    SearchTotalDrift,
+    /// Serve a group gap that can only be healed after the known discovery queue drains.
+    FinalScanOverflow,
 }
 
 /// Temporary directory removed automatically when the test exits.
@@ -1026,6 +1036,120 @@ fn crawl_auto_detects_facet_overflow_after_sorted_gap() {
 }
 
 #[test]
+fn crawl_self_heals_coverage_gap_after_known_queue_drains() {
+    let workspace = TempWorkspace::new("final-scan-overflow");
+    let server = MockRusnebServer::start(MockMode::FinalScanOverflow);
+    let db = workspace.join("state.sqlite");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--publishyear-prev")
+            .arg("1911")
+            .arg("--publishyear-next")
+            .arg("1911")
+            .arg("--shard-years")
+            .arg("--skip-no-year-shard")
+            .arg("--overflow-year")
+            .arg("1911")
+            .arg("--overflow-sort")
+            .arg("document_titlesort:desc")
+            .arg("--max-items")
+            .arg("0")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+
+    let requests = server.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.starts_with("/search/extended/")),
+        "self-healing scan did not load advanced-search facets: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("lang=facet-final")),
+        "self-healing scan did not seed facet shards after the manual shard drained: {requests:?}"
+    );
+    assert_eq!(search_item_count(&db), 4);
+
+    let validation = run_ok(
+        Command::new(parser_bin())
+            .arg("validate-coverage")
+            .arg("--db")
+            .arg(&db)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--require-year"),
+    );
+    let stdout = String::from_utf8(validation.stdout).expect("validation stdout is UTF-8");
+    assert!(stdout.contains("gap_groups: 0"));
+    assert!(stdout.contains("coverage ok"));
+}
+
+#[test]
+fn validate_coverage_accepts_latest_non_empty_total_after_search_total_drift() {
+    let workspace = TempWorkspace::new("total-drift");
+    let server = MockRusnebServer::start(MockMode::SearchTotalDrift);
+    let db = workspace.join("state.sqlite");
+
+    run_ok(
+        Command::new(parser_bin())
+            .arg("crawl")
+            .arg("--db")
+            .arg(&db)
+            .arg("--base-url")
+            .arg(&server.base_url)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--publishyear-prev")
+            .arg("1907")
+            .arg("--publishyear-next")
+            .arg("1907")
+            .arg("--shard-years")
+            .arg("--skip-no-year-shard")
+            .arg("--max-items")
+            .arg("0")
+            .arg("--workers")
+            .arg("1")
+            .arg("--timeout-secs")
+            .arg("5"),
+    );
+
+    assert_eq!(search_item_count(&db), 2);
+    let validation = run_ok(
+        Command::new(parser_bin())
+            .arg("validate-coverage")
+            .arg("--db")
+            .arg(&db)
+            .arg("--catalog")
+            .arg("25")
+            .arg("--access")
+            .arg("open")
+            .arg("--require-year"),
+    );
+    let stdout = String::from_utf8(validation.stdout).expect("validation stdout is UTF-8");
+    assert!(stdout.contains("gap_groups: 0"));
+    assert!(stdout.contains("coverage ok"));
+}
+
+#[test]
 fn validate_coverage_accepts_complete_overflow_group_union() {
     let workspace = TempWorkspace::new("overflow-union");
     let server = MockRusnebServer::start(MockMode::OverflowSearchCompleteUnion);
@@ -1302,6 +1426,8 @@ fn route_response(
         MockMode::NoYearSearch => route_no_year_search(target),
         MockMode::NoYearKnownStop => route_no_year_known_stop_search(target),
         MockMode::ResumePowerLoss => route_resume_power_loss(target),
+        MockMode::SearchTotalDrift => route_search_total_drift(target),
+        MockMode::FinalScanOverflow => route_final_scan_overflow(target),
     }
 }
 
@@ -1544,6 +1670,64 @@ fn route_resume_power_loss(target: &str) -> (u16, &'static str, String) {
         );
     }
     (404, "text/plain; charset=utf-8", "not found".to_string())
+}
+
+/// Return a search whose total count drops to match the latest non-empty page.
+fn route_search_total_drift(target: &str) -> (u16, &'static str, String) {
+    if target.starts_with("/search/") {
+        if target.contains("PAGEN_1=2") {
+            return (
+                200,
+                "text/html; charset=utf-8",
+                search_html(&[TOTAL_DRIFT_ID_B], 2),
+            );
+        }
+        if target.contains("PAGEN_1=3") {
+            return (200, "text/html; charset=utf-8", search_html(&[], 2));
+        }
+        return (
+            200,
+            "text/html; charset=utf-8",
+            search_html(&[TOTAL_DRIFT_ID_A], 3),
+        );
+    }
+    (404, "text/plain; charset=utf-8", "not found".to_string())
+}
+
+/// Return a group gap that needs the final self-healing scan to seed more sorted shards.
+fn route_final_scan_overflow(target: &str) -> (u16, &'static str, String) {
+    if target.starts_with("/search/extended/") {
+        return (
+            200,
+            "text/html; charset=utf-8",
+            advanced_filter_html(&[("lang", "facet-final")]),
+        );
+    }
+    if !target.starts_with("/search/") {
+        return (404, "text/plain; charset=utf-8", "not found".to_string());
+    }
+    if target.contains("PAGEN_1=2") {
+        return (200, "text/html; charset=utf-8", search_html(&[], 4));
+    }
+    if target.contains("lang=facet-final") {
+        return (
+            200,
+            "text/html; charset=utf-8",
+            search_html(&[FINAL_SCAN_ID_D], 1),
+        );
+    }
+    if target.contains("by=document_titlesort") && target.contains("order=desc") {
+        return (
+            200,
+            "text/html; charset=utf-8",
+            search_html(&[FINAL_SCAN_ID_B, FINAL_SCAN_ID_C], 2),
+        );
+    }
+    (
+        200,
+        "text/html; charset=utf-8",
+        search_html(&[FINAL_SCAN_ID_A], 4),
+    )
 }
 
 /// Write one HTTP/1.1 response.

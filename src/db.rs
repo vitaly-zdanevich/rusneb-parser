@@ -741,7 +741,19 @@ impl Db {
                      FROM search_items
                      WHERE search_items.search_key = search_pages.search_key
                  ),
-                 MAX(total_results),
+                 COALESCE(
+                     (
+                         SELECT latest_non_empty.total_results
+                         FROM search_pages AS latest_non_empty
+                         WHERE latest_non_empty.search_key = search_pages.search_key
+                           AND latest_non_empty.status = 'done'
+                           AND COALESCE(latest_non_empty.result_count, 0) > 0
+                           AND latest_non_empty.total_results IS NOT NULL
+                         ORDER BY latest_non_empty.page DESC
+                         LIMIT 1
+                     ),
+                     MAX(total_results)
+                 ),
                  MAX(CASE WHEN status = 'done' THEN page ELSE NULL END)
              FROM search_pages
              GROUP BY search_key
@@ -790,7 +802,19 @@ impl Db {
                          FROM search_items
                          WHERE search_items.search_key = search_pages.search_key
                      ),
-                     MAX(total_results),
+                     COALESCE(
+                         (
+                             SELECT latest_non_empty.total_results
+                             FROM search_pages AS latest_non_empty
+                             WHERE latest_non_empty.search_key = search_pages.search_key
+                               AND latest_non_empty.status = 'done'
+                               AND COALESCE(latest_non_empty.result_count, 0) > 0
+                               AND latest_non_empty.total_results IS NOT NULL
+                             ORDER BY latest_non_empty.page DESC
+                             LIMIT 1
+                         ),
+                         MAX(total_results)
+                     ),
                      MAX(CASE WHEN status = 'done' THEN page ELSE NULL END)
                  FROM search_pages
                  WHERE search_key = ?1
