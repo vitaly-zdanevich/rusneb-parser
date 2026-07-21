@@ -164,7 +164,7 @@ fn crawl_persists_record_resumes_and_exports_jsonl() {
     let output = workspace.join("out.jsonl");
     let manifest = workspace.join("manifest.json");
 
-    run_ok(
+    let crawl = run_ok(
         Command::new(parser_bin())
             .arg("crawl")
             .arg("--db")
@@ -182,6 +182,15 @@ fn crawl_persists_record_resumes_and_exports_jsonl() {
             .arg("--timeout-secs")
             .arg("5"),
     );
+    let crawl_stderr = String::from_utf8(crawl.stderr).expect("crawl stderr is UTF-8");
+    assert!(crawl_stderr.contains("worker usage:"));
+    assert!(crawl_stderr.contains("  configured_workers: 1"));
+    assert!(crawl_stderr.contains("  adaptive_enabled: false"));
+    assert!(crawl_stderr.contains("  minimum_allowed_workers: 1"));
+    assert!(crawl_stderr.contains("  minimum_active_workers: 1"));
+    assert!(crawl_stderr.contains("  maximum_active_workers: 1"));
+    assert!(crawl_stderr.contains("  average_active_workers: 1.0"));
+    assert!(crawl_stderr.contains("  final_active_workers: 1"));
     assert_eq!(server.requests().len(), 4);
 
     run_ok(

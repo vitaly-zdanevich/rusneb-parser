@@ -15,7 +15,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread;
@@ -539,9 +539,33 @@ struct WorkerControl {
     increase_after: u64,
     active_workers: AtomicUsize,
     stable_successes: AtomicU64,
+    usage: Mutex<WorkerUsage>,
+}
+
+/// Time-weighted history of the adaptive active-worker limit during one crawl.
+#[derive(Debug)]
+struct WorkerUsage {
+    started_at: Instant,
+    last_changed_at: Instant,
+    weighted_active_worker_nanos: u128,
+    min_active_workers: usize,
+    max_active_workers: usize,
+}
+
+/// Human-readable worker-limit telemetry printed when a crawl exits.
+#[derive(Debug)]
+struct WorkerUsageSummary {
+    configured_workers: usize,
+    adaptive_enabled: bool,
+    minimum_allowed_workers: usize,
+    minimum_active_workers: usize,
+    maximum_active_workers: usize,
+    average_active_workers: f64,
+    final_active_workers: usize,
 }
 
 impl WorkerControl {
+    /// Create shared adaptive worker control and start measuring worker-limit usage.
     fn new(
         enabled: bool,
         min_workers: usize,
@@ -549,6 +573,7 @@ impl WorkerControl {
         decrease_after: u64,
         increase_after: u64,
     ) -> Self {
+        let now = Instant::now();
         Self {
             enabled,
             min_workers,
@@ -557,6 +582,7 @@ impl WorkerControl {
             increase_after,
             active_workers: AtomicUsize::new(max_workers),
             stable_successes: AtomicU64::new(0),
+            usage: Mutex::new(WorkerUsage::new(now, max_workers)),
         }
     }
 
@@ -564,6 +590,7 @@ impl WorkerControl {
         !self.enabled || worker_id <= self.active_workers.load(Ordering::SeqCst)
     }
 
+    /// Record a successful item fetch and raise the active-worker limit after a stable streak.
     fn on_success(&self, worker_id: usize) {
         if !self.enabled {
             return;
@@ -594,6 +621,7 @@ impl WorkerControl {
                 Ordering::SeqCst,
             ) {
                 Ok(_) => {
+                    self.record_active_worker_change(current, next);
                     eprintln!(
                         "worker {worker_id}: adaptive workers increased to {next}/{} after {successes} successful item fetches",
                         self.max_workers
@@ -605,6 +633,7 @@ impl WorkerControl {
         }
     }
 
+    /// Record a transient error and lower the active-worker limit after an error burst.
     fn on_transient_error(&self, source: &str, consecutive_errors: u64) {
         if !self.enabled {
             return;
@@ -631,6 +660,7 @@ impl WorkerControl {
                 Ordering::SeqCst,
             ) {
                 Ok(_) => {
+                    self.record_active_worker_change(current, next);
                     eprintln!(
                         "{source}: adaptive workers decreased to {next}/{} after {consecutive_errors} consecutive transient errors",
                         self.max_workers
@@ -642,11 +672,96 @@ impl WorkerControl {
         }
     }
 
+    /// Reset the stable-success streak after a non-successful item fetch.
     fn on_item_failure(&self) {
         if self.enabled {
             self.stable_successes.store(0, Ordering::SeqCst);
         }
     }
+
+    /// Add one adaptive limit transition to the time-weighted usage history.
+    fn record_active_worker_change(&self, previous: usize, next: usize) {
+        self.usage
+            .lock()
+            .expect("worker usage mutex poisoned")
+            .record_change(Instant::now(), previous, next);
+    }
+
+    /// Build the final worker-limit usage report for this crawl.
+    fn usage_summary(&self) -> WorkerUsageSummary {
+        let final_active_workers = self.active_workers.load(Ordering::SeqCst);
+        let usage = self
+            .usage
+            .lock()
+            .expect("worker usage mutex poisoned")
+            .summary(Instant::now(), final_active_workers);
+        WorkerUsageSummary {
+            configured_workers: self.max_workers,
+            adaptive_enabled: self.enabled,
+            minimum_allowed_workers: if self.enabled {
+                self.min_workers
+            } else {
+                self.max_workers
+            },
+            minimum_active_workers: usage.minimum_active_workers,
+            maximum_active_workers: usage.maximum_active_workers,
+            average_active_workers: usage.average_active_workers,
+            final_active_workers,
+        }
+    }
+}
+
+impl WorkerUsage {
+    /// Start measuring active-worker limits from a known point in time.
+    fn new(now: Instant, active_workers: usize) -> Self {
+        Self {
+            started_at: now,
+            last_changed_at: now,
+            weighted_active_worker_nanos: 0,
+            min_active_workers: active_workers,
+            max_active_workers: active_workers,
+        }
+    }
+
+    /// Record that the active-worker limit changed from `previous` to `next`.
+    fn record_change(&mut self, now: Instant, previous: usize, next: usize) {
+        self.add_interval(now, previous);
+        self.last_changed_at = now;
+        self.min_active_workers = self.min_active_workers.min(next);
+        self.max_active_workers = self.max_active_workers.max(next);
+    }
+
+    /// Return usage metrics including the current open interval.
+    fn summary(&self, now: Instant, current: usize) -> WorkerUsageSnapshot {
+        let mut weighted_active_worker_nanos = self.weighted_active_worker_nanos;
+        weighted_active_worker_nanos +=
+            now.duration_since(self.last_changed_at).as_nanos() * usize_to_u128(current);
+        let total_nanos = now.duration_since(self.started_at).as_nanos();
+        let average_active_workers = if total_nanos == 0 {
+            current as f64
+        } else {
+            weighted_active_worker_nanos as f64 / total_nanos as f64
+        };
+        WorkerUsageSnapshot {
+            minimum_active_workers: self.min_active_workers.min(current),
+            maximum_active_workers: self.max_active_workers.max(current),
+            average_active_workers,
+        }
+    }
+
+    /// Accumulate one time interval at a fixed active-worker limit.
+    fn add_interval(&mut self, now: Instant, active_workers: usize) {
+        self.weighted_active_worker_nanos +=
+            now.duration_since(self.last_changed_at).as_nanos() * usize_to_u128(active_workers);
+    }
+}
+
+/// Computed worker-limit usage over one crawl.
+#[derive(Debug)]
+struct WorkerUsageSnapshot {
+    minimum_active_workers: usize,
+    maximum_active_workers: usize,
+    average_active_workers: f64,
 }
 
 fn main() -> Result<()> {
@@ -1401,6 +1516,7 @@ fn crawl(args: CrawlArgs) -> Result<()> {
         "item workers stopped: saved={}, missing={}, failed={}, deferred={}",
         worker_stats.saved, worker_stats.missing, worker_stats.failed, worker_stats.deferred
     );
+    print_worker_usage_summary(&worker_control.usage_summary());
 
     let completion_error = report_crawl_completion(
         &db.crawl_completion_summary(args.max_attempts)?,
@@ -2104,6 +2220,30 @@ fn unfinished_work(summary: &db::CrawlCompletionSummary) -> u64 {
         + summary.retryable_failed_search_pages
 }
 
+/// Print adaptive worker-limit telemetry for choosing future --workers values.
+fn print_worker_usage_summary(summary: &WorkerUsageSummary) {
+    eprintln!("worker usage:");
+    eprintln!("  configured_workers: {}", summary.configured_workers);
+    eprintln!("  adaptive_enabled: {}", summary.adaptive_enabled);
+    eprintln!(
+        "  minimum_allowed_workers: {}",
+        summary.minimum_allowed_workers
+    );
+    eprintln!(
+        "  minimum_active_workers: {}",
+        summary.minimum_active_workers
+    );
+    eprintln!(
+        "  maximum_active_workers: {}",
+        summary.maximum_active_workers
+    );
+    eprintln!(
+        "  average_active_workers: {:.1}",
+        summary.average_active_workers
+    );
+    eprintln!("  final_active_workers: {}", summary.final_active_workers);
+}
+
 /// Return an absolute path for display without requiring every platform to support canonicalize.
 fn absolute_display_path(path: &Path) -> String {
     let absolute = path.canonicalize().unwrap_or_else(|_| {
@@ -2132,6 +2272,10 @@ fn human_readable_bytes(bytes: u64) -> String {
         unit += 1;
     }
     format!("{value:.1} {}", UNITS[unit])
+}
+
+fn usize_to_u128(value: usize) -> u128 {
+    value as u128
 }
 
 fn coverage_validation_summary(
@@ -2742,5 +2886,19 @@ mod tests {
         assert_eq!(human_readable_bytes(1024), "1.0 KiB");
         assert_eq!(human_readable_bytes(1_536), "1.5 KiB");
         assert_eq!(human_readable_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
+    }
+
+    #[test]
+    fn calculates_average_active_workers_over_time() {
+        let start = Instant::now();
+        let mut usage = WorkerUsage::new(start, 2);
+
+        usage.record_change(start + Duration::from_secs(1), 2, 1);
+        usage.record_change(start + Duration::from_secs(2), 1, 3);
+        let summary = usage.summary(start + Duration::from_secs(3), 3);
+
+        assert_eq!(summary.minimum_active_workers, 1);
+        assert_eq!(summary.maximum_active_workers, 3);
+        assert_eq!(format!("{:.1}", summary.average_active_workers), "2.0");
     }
 }
